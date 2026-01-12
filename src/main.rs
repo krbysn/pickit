@@ -60,7 +60,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: app::App, // Removed _ to use app
+    app: app::App,
 ) -> io::Result<()> {
     loop {
         terminal.draw(|f| {
@@ -85,9 +85,12 @@ fn run_app(
             let grid_area = main_chunks[1];
 
             // --- Tree View ---
-            let tree_items: Vec<ListItem> = app.all_dirs
+            let tree_items: Vec<ListItem> = app.filtered_item_indices
                 .iter()
-                .map(|dir| ListItem::new(dir.as_str()))
+                .map(|&idx| {
+                    let item = &app.items[idx];
+                    ListItem::new(item.name.clone())
+                })
                 .collect();
             let tree_list = List::new(tree_items)
                 .block(Block::default().borders(Borders::ALL).title(" Tree View "));
