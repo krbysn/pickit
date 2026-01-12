@@ -23,6 +23,12 @@
 - **TUIのテスト:** TUIコンポーネントのテストは困難なため、UI表示に関わるロジックは最小限にし、状態管理ロジックを分離してテストカバレッジを確保します。
 
 ## 5. コミット・Pull Request (PR)
+- **ブランチ戦略:**
+    - `main` ブランチを保護ブランチとし、直接のプッシュは禁止します。
+    - 各PRに対して、`main` ブランチから新しいフィーチャーブランチを作成します。
+- **ブランチ命名規則:**
+    - ブランチ名は `feature/PR<#>-<簡潔な説明>` の形式とします。
+    - 例: `feature/PR1-git-module`, `feature/PR2-tui-skeleton`
 - **コミットメッセージ:** [Conventional Commits](https://www.conventionalcommits.org/) の規約に準拠します。
     - 例: `feat:`, `fix:`, `refactor:`, `docs:`, `test:`
 - **PRの単位:** 後述の `plan.md` に記載された単位でPRを作成します。各PRは小さく、焦点を絞ったものにします。
