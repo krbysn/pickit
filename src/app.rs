@@ -1,11 +1,18 @@
 use crate::git;
+use ratatui::style::{Color, Style};
 use std::{collections::HashMap, path::{Path, PathBuf}};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[allow(dead_code)] // Will be used when applying changes
 pub enum ChangeType {
     Add,
     Remove,
+}
+
+/// Holds the display-ready information for a single item in the tree view.
+#[derive(Debug, Clone)]
+pub struct TuiTreeItemViewModel {
+    pub display_text: String,
+    pub style: Style,
 }
 
 #[derive(Debug, Clone)]
@@ -15,9 +22,7 @@ pub struct TreeItem {
     pub children_indices: Vec<usize>, // Indices of direct children in the App's items vec
     pub parent_index: Option<usize>,
     pub is_expanded: bool,
-    #[allow(dead_code)] // Read in PR #4 (TUI integration)
     pub is_checked_out: bool,
-    #[allow(dead_code)] // Read in PR #4 (TUI integration)
     pub pending_change: Option<ChangeType>,
     pub is_locked: bool,                      // If this item cannot be deselected
     pub contains_uncommitted_changes: bool, // For determining `is_locked`
@@ -45,7 +50,6 @@ pub struct App {
     pub current_repo_root: PathBuf,
     pub items: Vec<TreeItem>, // Flat list of all directories
     pub filtered_item_indices: Vec<usize>, // Indices of items currently visible in the TUI
-    #[allow(dead_code)] // Read in PR #4 (TUI integration)
     pub selected_item_index: usize, // Index into `filtered_item_indices`
     #[allow(dead_code)] // Will be used for TUI scrolling
     pub scroll_offset: usize, // For scrolling the TUI view
@@ -53,8 +57,64 @@ pub struct App {
     pub last_git_error: Option<String>, // To display transient git errors
 }
 
-#[allow(dead_code)] // Functions are used by tests, but will be used by TUI in PR #4
 impl App {
+    pub fn get_tui_tree_items(&self) -> Vec<TuiTreeItemViewModel> {
+        self.filtered_item_indices
+            .iter()
+            .enumerate()
+            .map(|(view_idx, &global_idx)| {
+                let item = &self.items[global_idx];
+
+                // 1. Determine Style (Color)
+                let mut style = Style::default();
+                if item.is_locked {
+                    style = style.fg(Color::Red);
+                } else if item.pending_change.is_some() {
+                    style = style.fg(Color::Yellow);
+                } else if item.is_checked_out {
+                    style = style.fg(Color::Green);
+                }
+                
+                // Highlight the selected item
+                if view_idx == self.selected_item_index {
+                    style = style.bg(Color::Blue);
+                }
+
+                // 2. Determine Expansion Symbol
+                let expansion_symbol = if !item.children_indices.is_empty() {
+                    if item.is_expanded { "▾ " } else { "▸ " }
+                } else {
+                    "  " // No children, so no symbol
+                };
+
+                // 3. Determine State Symbol
+                let state_symbol = if item.is_locked {
+                    "🔒 "
+                } else {
+                    match item.pending_change {
+                        Some(ChangeType::Add) => "+ ",
+                        Some(ChangeType::Remove) => "- ",
+                        None => {
+                            if item.is_checked_out { "✔ " } else { "☐ " }
+                        }
+                    }
+                };
+
+                // 4. Determine indentation
+                let mut current_idx = global_idx;
+                let mut indent = String::new();
+                while let Some(parent_idx) = self.items[current_idx].parent_index {
+                    indent.insert_str(0, "  ");
+                    current_idx = parent_idx;
+                }
+                
+                let display_text = format!("{}{}{}{}", indent, expansion_symbol, state_symbol, item.name);
+
+                TuiTreeItemViewModel { display_text, style }
+            })
+            .collect()
+    }
+
     pub fn new() -> Result<Self, git::Error> {
         let current_repo_root = git::find_repo_root()?;
         let mut all_dirs = git::get_all_dirs()?;

@@ -17,7 +17,8 @@ use crossterm::{
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    widgets::{Block, Borders, List, ListItem},
+    text::Line,
+    widgets::{Block, Borders, List, ListItem, ListState},
     Terminal,
 };
 
@@ -30,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run it
-    let app = match app::App::new() {
+    let mut app = match app::App::new() {
         Ok(app) => app,
         Err(e) => {
             eprintln!("Error initializing application: {}", e);
@@ -39,7 +40,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let res = run_app(&mut terminal, app);
+    let res = run_app(&mut terminal, &mut app);
 
     // Restore terminal
     restore_terminal(&mut terminal)?;
@@ -60,8 +61,10 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
-    app: app::App,
+    app: &mut app::App,
 ) -> io::Result<()> {
+    let mut list_state = ListState::default();
+
     loop {
         terminal.draw(|f| {
             let size = f.area();
@@ -69,7 +72,7 @@ fn run_app(
             // Define main layout (main_area + footer)
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(3)]) // Main area, then 3 lines for footer
+                .constraints([Constraint::Min(0), Constraint::Length(3)])
                 .split(size);
 
             let main_area = chunks[0];
@@ -85,16 +88,20 @@ fn run_app(
             let grid_area = main_chunks[1];
 
             // --- Tree View ---
-            let tree_items: Vec<ListItem> = app.filtered_item_indices
-                .iter()
-                .map(|&idx| {
-                    let item = &app.items[idx];
-                    ListItem::new(item.name.clone())
+            let tree_items_vm = app.get_tui_tree_items();
+            let tree_items: Vec<ListItem> = tree_items_vm
+                .into_iter()
+                .map(|vm| {
+                    ListItem::new(Line::from(vm.display_text)).style(vm.style)
                 })
                 .collect();
+
+            list_state.select(Some(app.selected_item_index));
+
             let tree_list = List::new(tree_items)
                 .block(Block::default().borders(Borders::ALL).title(" Tree View "));
-            f.render_widget(tree_list, tree_area);
+            
+            f.render_stateful_widget(tree_list, tree_area, &mut list_state);
 
 
             // --- Grid View ---
@@ -106,14 +113,21 @@ fn run_app(
             // --- Footer ---
             let footer_block = Block::default()
                 .borders(Borders::ALL)
-                .title(" Footer - Press 'q' to quit ");
+                .title(" [↑/↓] Navigate [→/←] Expand/Collapse [Space] Toggle [q] Quit ");
             f.render_widget(footer_block, footer_area);
         })?;
 
-        #[allow(clippy::collapsible_if)]
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? && key.code == KeyCode::Char('q') {
-                return Ok(());
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Up => app.move_cursor_up(),
+                    KeyCode::Down => app.move_cursor_down(),
+                    KeyCode::Left => app.toggle_expansion(), // For now, just collapses
+                    KeyCode::Right => app.toggle_expansion(), // For now, just expands
+                    KeyCode::Char(' ') => app.toggle_selection(),
+                    _ => {}
+                }
             }
         }
     }
