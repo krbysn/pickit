@@ -14,7 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, List, ListItem, ListState, Row, Table},
     Terminal,
 };
-use std::{error::Error, io::Stdout, path::PathBuf, time::Duration};
+use std::{error::Error, io, io::Stdout, path::PathBuf, time::Duration};
 
 mod app;
 mod git;
@@ -79,7 +79,7 @@ fn run_app(
 
     loop {
         terminal.draw(|f| {
-            let size = f.area();
+            let size = f.size();
 
             // Define main layout (main_area + footer)
             let chunks = Layout::default()
