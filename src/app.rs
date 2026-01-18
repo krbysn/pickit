@@ -41,6 +41,7 @@ pub struct TreeItem {
     pub is_locked: bool,                    // If this item cannot be deselected
     pub contains_uncommitted_changes: bool, // For determining `is_locked`
     pub has_checked_out_descendant: bool,
+    pub is_implicitly_checked_out: bool,
 }
 
 impl TreeItem {
@@ -56,6 +57,7 @@ impl TreeItem {
             is_locked: false,
             contains_uncommitted_changes: false,
             has_checked_out_descendant: false,
+            is_implicitly_checked_out: false, // Initialize new field
         }
     }
 }
@@ -182,10 +184,25 @@ impl App {
             }
         }
 
+        // Calculate `is_implicitly_checked_out` (pre-order traversal)
+        for i in 0..final_items.len() {
+            // Check if current item has a parent
+            if let Some(parent_idx) = final_items[i].parent_index {
+                // An item is implicitly checked out if its parent is checked out or implicitly checked out
+                if final_items[parent_idx].is_checked_out
+                    || final_items[parent_idx].is_implicitly_checked_out
+                {
+                    final_items[i].is_implicitly_checked_out = true;
+                }
+            }
+        }
+
         // Post-order traversal to calculate `has_checked_out_descendant`
+        // `has_checked_out_descendant` means it has an *explicitly* checked out child or implicitly checked out child
         for i in (0..final_items.len()).rev() {
             let has_checked_out_child = final_items[i].children_indices.iter().any(|&child_idx| {
                 final_items[child_idx].is_checked_out
+                    || final_items[child_idx].is_implicitly_checked_out
                     || final_items[child_idx].has_checked_out_descendant
             });
             if has_checked_out_child {
@@ -270,10 +287,12 @@ impl App {
                     style = style.fg(Color::Yellow);
                 } else if item.is_checked_out {
                     style = style.fg(Color::Green);
+                } else if item.is_implicitly_checked_out {
+                    style = style.fg(Color::White); // New: implicitly checked out
                 } else if item.has_checked_out_descendant {
-                    style = style.fg(Color::White); // Reverted to White
+                    style = style.fg(Color::White); // Still White for explicit descendant
                 } else {
-                    style = style.fg(Color::DarkGray); // Remains DarkGray
+                    style = style.fg(Color::DarkGray);
                 }
 
                 // Highlight the selected item
@@ -547,6 +566,7 @@ mod tests {
         assert_eq!(app.selected_item_index, 2);
     }
 
+    // --- Tests for Navigation ---
     #[test]
     fn test_move_cursor_up() {
         let app_root = "/test/repo";
@@ -622,7 +642,7 @@ mod tests {
     fn test_toggle_selection_add() {
         let app_root = "/test/repo";
         let all_dirs = vec![".".to_string(), "src".to_string()];
-        let sparse_checkout = vec![]; // src not checked out initially
+        let sparse_checkout = vec![];
         let uncommitted = vec![];
 
         let mut app = create_mock_app(app_root, all_dirs, sparse_checkout, uncommitted);
