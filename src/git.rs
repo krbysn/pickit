@@ -55,6 +55,16 @@ pub fn has_uncommitted_changes(path: &Path) -> Result<bool> {
     Ok(!output.trim().is_empty())
 }
 
+pub fn set_sparse_checkout_dirs(dirs: Vec<String>) -> Result<()> {
+    let mut args = vec!["sparse-checkout", "set"];
+    // This is a workaround because `dirs` is Vec<String> and `args` is Vec<&str>
+    let dirs_as_strs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
+    args.extend(dirs_as_strs);
+
+    run_git_command(&args)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

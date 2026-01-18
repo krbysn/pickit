@@ -135,21 +135,30 @@ fn run_app(
             }
 
             // --- Footer ---
+            let footer_text = if let Some(err) = &app.last_git_error {
+                err.clone()
+            } else {
+                " [↑/↓] Navigate [→/←] Expand/Collapse [Space] Toggle [a] Apply [q] Quit ".to_string()
+            };
             let footer_block = Block::default()
                 .borders(Borders::ALL)
-                .title(" [↑/↓] Navigate [→/←] Expand/Collapse [Space] Toggle [q] Quit ");
+                .title(footer_text);
             f.render_widget(footer_block, footer_area);
         })?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
+                // It's important to clear the error on any key press
+                app.last_git_error = None;
+                
                 match key.code {
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Up => app.move_cursor_up(),
                     KeyCode::Down => app.move_cursor_down(),
-                    KeyCode::Left => app.toggle_expansion(), // For now, just collapses
-                    KeyCode::Right => app.toggle_expansion(), // For now, just expands
+                    KeyCode::Left => app.toggle_expansion(),
+                    KeyCode::Right => app.toggle_expansion(),
                     KeyCode::Char(' ') => app.toggle_selection(),
+                    KeyCode::Char('a') => app.apply_changes(),
                     _ => {}
                 }
             }

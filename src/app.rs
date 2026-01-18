@@ -69,6 +69,110 @@ pub struct App {
 }
 
 impl App {
+    /// Applies the pending changes to the git sparse-checkout set.
+    pub fn apply_changes(&mut self) {
+        let dirs_to_checkout: Vec<String> = self
+            .items
+            .iter()
+            .filter_map(|item| {
+                let is_currently_checked_out = item.is_checked_out;
+                let pending_change = item.pending_change;
+
+                // Determine if the item should be in the final set
+                let should_be_checked_out = match pending_change {
+                    Some(ChangeType::Add) => true,
+                    Some(ChangeType::Remove) => false,
+                    None => is_currently_checked_out,
+                };
+                
+                // We only need to include directories that should be checked out
+                if should_be_checked_out && item.path != "." {
+                    Some(item.path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        
+        match git::set_sparse_checkout_dirs(dirs_to_checkout) {
+            Ok(_) => {
+                // Clear any previous error and refresh the state
+                self.last_git_error = None;
+                if self.refresh().is_err() {
+                    // If refreshing fails, we should probably note that
+                    self.last_git_error = Some("Failed to refresh state after applying changes.".to_string());
+                }
+            }
+            Err(e) => {
+                self.last_git_error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// Refreshes the application state by re-reading the git repository.
+    fn refresh(&mut self) -> Result<(), git::Error> {
+        let all_dirs = git::get_all_dirs()?;
+        let sparse_checkout_dirs = match git::get_sparse_checkout_list() {
+            Ok(list) => list,
+            Err(git::Error::GitCommand(err_msg)) if err_msg.contains("fatal: this worktree is not sparse") => Vec::new(),
+            Err(e) => return Err(e),
+        };
+
+        let mut items = Vec::new();
+        let mut path_to_index: HashMap<String, usize> = HashMap::new();
+
+        // Ensure root is always present
+        let mut sorted_all_dirs = all_dirs;
+        sorted_all_dirs.sort_unstable();
+        if !sorted_all_dirs.contains(&".".to_string()) {
+            sorted_all_dirs.insert(0, ".".to_string());
+        }
+
+        for (i, dir_path) in sorted_all_dirs.into_iter().enumerate() {
+            let is_checked_out = sparse_checkout_dirs.contains(&dir_path);
+            let name = if dir_path == "." {
+                self.current_repo_root.file_name().unwrap_or_default().to_string_lossy().to_string()
+            } else {
+                PathBuf::from(&dir_path).file_name().unwrap_or_default().to_string_lossy().to_string()
+            };
+
+            let contains_uncommitted_changes = git::has_uncommitted_changes(Path::new(&dir_path))?;
+            let is_locked = contains_uncommitted_changes || dir_path == ".";
+
+            let mut item = TreeItem::new(dir_path.clone(), name, is_checked_out);
+            item.contains_uncommitted_changes = contains_uncommitted_changes;
+            item.is_locked = is_locked;
+
+            if dir_path != "." {
+                let parent_path = PathBuf::from(&dir_path).parent().map(|p| p.to_string_lossy().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| ".".to_string());
+                if let Some(&parent_idx) = path_to_index.get(&parent_path) {
+                    item.parent_index = Some(parent_idx);
+                }
+            }
+
+            path_to_index.insert(dir_path, i);
+            items.push(item);
+        }
+
+        let mut final_items = items;
+        for i in 0..final_items.len() {
+            if let Some(parent_idx) = final_items[i].parent_index {
+                final_items[parent_idx].children_indices.push(i);
+            }
+        }
+        
+        if let Some(root_item) = final_items.get_mut(0) {
+            if root_item.path == "." {
+                root_item.is_expanded = true;
+            }
+        }
+
+        self.items = final_items;
+        self.build_visible_items();
+        self.selected_item_index = 0; // Reset cursor
+        Ok(())
+    }
+
     /// Counts pending changes recursively starting from a given item index.
     fn count_pending_changes_recursive(&self, item_index: usize) -> u32 {
         let item = &self.items[item_index];
@@ -180,88 +284,11 @@ impl App {
 
     pub fn new() -> Result<Self, git::Error> {
         let current_repo_root = git::find_repo_root()?;
-        let mut all_dirs = git::get_all_dirs()?;
-        all_dirs.sort_unstable(); // Sort for consistent tree building
-
-        let sparse_checkout_dirs = match git::get_sparse_checkout_list() {
-            Ok(list) => list,
-            Err(git::Error::GitCommand(err_msg)) if err_msg.contains("fatal: this worktree is not sparse") => {
-                // Temporary workaround for PR#2: if sparse-checkout is not enabled, treat it as empty
-                Vec::new()
-            },
-            Err(e) => return Err(e), // Propagate other errors
-        };
-
-        let mut items = Vec::new();
-        let mut path_to_index: HashMap<String, usize> = HashMap::new();
-
-        // Ensure root directory is always present in all_dirs for tree building
-        if !all_dirs.contains(&".".to_string()) {
-            all_dirs.insert(0, ".".to_string());
-        }
-
-
-        for (i, dir_path) in all_dirs.into_iter().enumerate() {
-            let is_checked_out = sparse_checkout_dirs.contains(&dir_path);
-            let name = if dir_path == "." {
-                current_repo_root.file_name().unwrap_or_default().to_string_lossy().to_string()
-            } else {
-                PathBuf::from(&dir_path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string()
-            };
-            
-            let contains_uncommitted_changes = git::has_uncommitted_changes(Path::new(&dir_path))?;
-            let is_locked = contains_uncommitted_changes || dir_path == "."; // Lock root and any dir with changes
-
-            let mut item = TreeItem::new(dir_path.clone(), name, is_checked_out);
-            item.contains_uncommitted_changes = contains_uncommitted_changes;
-            item.is_locked = is_locked;
-            
-            if dir_path != "." {
-                let parent_path = PathBuf::from(&dir_path)
-                    .parent()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| ".".to_string());
-
-                if let Some(&parent_idx) = path_to_index.get(&parent_path) {
-                    item.parent_index = Some(parent_idx);
-                }
-            }
-
-            path_to_index.insert(dir_path, i);
-            items.push(item);
-        }
-
-        // Second pass to populate children_indices
-        let mut final_items = items.clone(); 
-        for (i, item) in items.iter().enumerate() {
-            if let Some(parent_idx) = item.parent_index && parent_idx < final_items.len() {
-                final_items[parent_idx].children_indices.push(i);
-            }
-        }
-        items = final_items;
-
-
-        // Always expand the root node, if it exists
-        if let Some(root_item) = items.get_mut(0) && root_item.path == "." {
-            root_item.is_expanded = true;
-        }
-
         let mut app = App {
             current_repo_root,
-            items,
-            filtered_item_indices: Vec::new(),
-            selected_item_index: 0,
-            scroll_offset: 0,
-            last_git_error: None,
+            ..Default::default()
         };
-
-        app.build_visible_items();
-
+        app.refresh()?;
         Ok(app)
     }
 
