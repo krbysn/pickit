@@ -79,7 +79,7 @@ fn run_app(
 
     loop {
         terminal.draw(|f| {
-            let size = f.size();
+            let size = f.area();
 
             // Define main layout (main_area + footer)
             let chunks = Layout::default()
