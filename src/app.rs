@@ -1,6 +1,9 @@
 use crate::git;
 use ratatui::style::{Color, Style};
-use std::{collections::HashMap, path::{Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ChangeType {
@@ -35,8 +38,9 @@ pub struct TreeItem {
     pub is_expanded: bool,
     pub is_checked_out: bool,
     pub pending_change: Option<ChangeType>,
-    pub is_locked: bool,                      // If this item cannot be deselected
+    pub is_locked: bool,                    // If this item cannot be deselected
     pub contains_uncommitted_changes: bool, // For determining `is_locked`
+    pub has_checked_out_descendant: bool,
 }
 
 impl TreeItem {
@@ -51,6 +55,7 @@ impl TreeItem {
             pending_change: None,
             is_locked: false,
             contains_uncommitted_changes: false,
+            has_checked_out_descendant: false,
         }
     }
 }
@@ -59,13 +64,12 @@ impl TreeItem {
 pub struct App {
     #[allow(dead_code)] // Will be used in UI and other places
     pub current_repo_root: PathBuf,
-    pub items: Vec<TreeItem>, // Flat list of all directories
+    pub items: Vec<TreeItem>,              // Flat list of all directories
     pub filtered_item_indices: Vec<usize>, // Indices of items currently visible in the TUI
-    pub selected_item_index: usize, // Index into `filtered_item_indices`
+    pub selected_item_index: usize,        // Index into `filtered_item_indices`
     #[allow(dead_code)] // Will be used for TUI scrolling
     pub scroll_offset: usize, // For scrolling the TUI view
-    #[allow(dead_code)] // Will be used to display errors in TUI
-    pub last_git_error: Option<String>, // To display transient git errors
+    pub last_git_error: Option<String>,    // To display transient git errors
 }
 
 impl App {
@@ -84,7 +88,7 @@ impl App {
                     Some(ChangeType::Remove) => false,
                     None => is_currently_checked_out,
                 };
-                
+
                 // We only need to include directories that should be checked out
                 if should_be_checked_out && item.path != "." {
                     Some(item.path.clone())
@@ -93,14 +97,15 @@ impl App {
                 }
             })
             .collect();
-        
+
         match git::set_sparse_checkout_dirs(dirs_to_checkout) {
             Ok(_) => {
                 // Clear any previous error and refresh the state
                 self.last_git_error = None;
                 if self.refresh().is_err() {
                     // If refreshing fails, we should probably note that
-                    self.last_git_error = Some("Failed to refresh state after applying changes.".to_string());
+                    self.last_git_error =
+                        Some("Failed to refresh state after applying changes.".to_string());
                 }
             }
             Err(e) => {
@@ -114,7 +119,11 @@ impl App {
         let all_dirs = git::get_all_dirs()?;
         let sparse_checkout_dirs = match git::get_sparse_checkout_list() {
             Ok(list) => list,
-            Err(git::Error::GitCommand(err_msg)) if err_msg.contains("fatal: this worktree is not sparse") => Vec::new(),
+            Err(git::Error::GitCommand(err_msg))
+                if err_msg.contains("fatal: this worktree is not sparse") =>
+            {
+                Vec::new()
+            }
             Err(e) => return Err(e),
         };
 
@@ -131,9 +140,17 @@ impl App {
         for (i, dir_path) in sorted_all_dirs.into_iter().enumerate() {
             let is_checked_out = sparse_checkout_dirs.contains(&dir_path);
             let name = if dir_path == "." {
-                self.current_repo_root.file_name().unwrap_or_default().to_string_lossy().to_string()
+                self.current_repo_root
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
             } else {
-                PathBuf::from(&dir_path).file_name().unwrap_or_default().to_string_lossy().to_string()
+                PathBuf::from(&dir_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
             };
 
             let contains_uncommitted_changes = git::has_uncommitted_changes(Path::new(&dir_path))?;
@@ -144,7 +161,11 @@ impl App {
             item.is_locked = is_locked;
 
             if dir_path != "." {
-                let parent_path = PathBuf::from(&dir_path).parent().map(|p| p.to_string_lossy().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| ".".to_string());
+                let parent_path = PathBuf::from(&dir_path)
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| ".".to_string());
                 if let Some(&parent_idx) = path_to_index.get(&parent_path) {
                     item.parent_index = Some(parent_idx);
                 }
@@ -160,11 +181,20 @@ impl App {
                 final_items[parent_idx].children_indices.push(i);
             }
         }
-        
-        if let Some(root_item) = final_items.get_mut(0) {
-            if root_item.path == "." {
-                root_item.is_expanded = true;
+
+        // Post-order traversal to calculate `has_checked_out_descendant`
+        for i in (0..final_items.len()).rev() {
+            let has_checked_out_child = final_items[i].children_indices.iter().any(|&child_idx| {
+                final_items[child_idx].is_checked_out
+                    || final_items[child_idx].has_checked_out_descendant
+            });
+            if has_checked_out_child {
+                final_items[i].has_checked_out_descendant = true;
             }
+        }
+
+        if !final_items.is_empty() && final_items[0].path == "." {
+            final_items[0].is_expanded = true;
         }
 
         self.items = final_items;
@@ -210,7 +240,7 @@ impl App {
                     .iter()
                     .filter(|&&child_idx| self.items[child_idx].is_checked_out)
                     .count();
-                
+
                 let pending_changes = self.count_pending_changes_recursive(global_idx);
 
                 GridViewModel {
@@ -240,8 +270,12 @@ impl App {
                     style = style.fg(Color::Yellow);
                 } else if item.is_checked_out {
                     style = style.fg(Color::Green);
+                } else if item.has_checked_out_descendant {
+                    style = style.fg(Color::White); // Reverted to White
+                } else {
+                    style = style.fg(Color::DarkGray); // Remains DarkGray
                 }
-                
+
                 // Highlight the selected item
                 if view_idx == self.selected_item_index {
                     style = style.bg(Color::Blue);
@@ -249,7 +283,11 @@ impl App {
 
                 // 2. Determine Expansion Symbol
                 let expansion_symbol = if !item.children_indices.is_empty() {
-                    if item.is_expanded { "▾ " } else { "▸ " }
+                    if item.is_expanded {
+                        "▾ "
+                    } else {
+                        "▸ "
+                    }
                 } else {
                     "  " // No children, so no symbol
                 };
@@ -262,7 +300,13 @@ impl App {
                         Some(ChangeType::Add) => "+ ",
                         Some(ChangeType::Remove) => "- ",
                         None => {
-                            if item.is_checked_out { "✔ " } else { "☐ " }
+                            if item.is_checked_out {
+                                "✔ "
+                            } else if item.has_checked_out_descendant {
+                                "☐·"
+                            } else {
+                                "☐ "
+                            }
                         }
                     }
                 };
@@ -274,10 +318,16 @@ impl App {
                     indent.insert_str(0, "  ");
                     current_idx = parent_idx;
                 }
-                
-                let display_text = format!("{}{}{}{}", indent, expansion_symbol, state_symbol, item.name);
 
-                TuiTreeItemViewModel { display_text, style }
+                let display_text = format!(
+                    "{}{}{}{}",
+                    indent, expansion_symbol, state_symbol, item.name
+                );
+
+                TuiTreeItemViewModel {
+                    display_text,
+                    style,
+                }
             })
             .collect()
     }
@@ -297,7 +347,7 @@ impl App {
         self.filtered_item_indices.clear();
         for i in 0..self.items.len() {
             let _item = &self.items[i]; // Changed 'item' to '_item'
-            
+
             // Corrected logic: Check if all its ancestors are expanded
             let mut current_idx = i;
             let mut is_visible = true;
@@ -395,7 +445,11 @@ mod tests {
         for (i, dir_path) in sorted_all_dirs.into_iter().enumerate() {
             let is_checked_out = sparse_checkout_dirs.contains(&dir_path);
             let name = if dir_path == "." {
-                current_repo_root.file_name().unwrap_or_default().to_string_lossy().to_string()
+                current_repo_root
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 PathBuf::from(&dir_path)
                     .file_name()
@@ -416,10 +470,10 @@ mod tests {
         }
 
         // Second pass to populate children_indices and parent_index
-        let mut final_items = items.clone(); 
+        let mut final_items = items.clone();
         for (i, item) in items.iter().enumerate() {
             if item.path != "." {
-                 let parent_path = PathBuf::from(&item.path)
+                let parent_path = PathBuf::from(&item.path)
                     .parent()
                     .map(|p| p.to_string_lossy().to_string())
                     .filter(|s| !s.is_empty())
@@ -459,12 +513,12 @@ mod tests {
     #[test]
     fn test_app_new_initial_state() {
         let app = App::new().expect("App initialization failed");
-        
+
         // Assert on the structure and some properties
         assert!(!app.items.is_empty());
         assert_eq!(app.selected_item_index, 0);
         assert!(!app.filtered_item_indices.is_empty());
-        
+
         let root_item = &app.items[app.filtered_item_indices[0]];
         assert_eq!(root_item.path, ".");
         assert!(root_item.is_expanded);
@@ -481,10 +535,10 @@ mod tests {
 
         let mut app = create_mock_app(app_root, all_dirs, sparse_checkout, uncommitted);
         assert_eq!(app.selected_item_index, 0);
-        
+
         app.move_cursor_down();
         assert_eq!(app.selected_item_index, 1);
-        
+
         app.move_cursor_down();
         assert_eq!(app.selected_item_index, 2);
 
@@ -502,10 +556,10 @@ mod tests {
 
         let mut app = create_mock_app(app_root, all_dirs, sparse_checkout, uncommitted);
         app.selected_item_index = 2; // Start at the last item
-        
+
         app.move_cursor_up();
         assert_eq!(app.selected_item_index, 1);
-        
+
         app.move_cursor_up();
         assert_eq!(app.selected_item_index, 0);
 
@@ -528,15 +582,23 @@ mod tests {
         let uncommitted = vec![];
 
         let mut app = create_mock_app(app_root, all_dirs, sparse_checkout, uncommitted);
-        
+
         // Initial state: root expanded, others collapsed
         // Filtered: [0 (.), 1 (src), 3 (docs)]
-        assert_eq!(app.filtered_item_indices.len(), 3); 
+        assert_eq!(app.filtered_item_indices.len(), 3);
         let src_global_idx = app.items.iter().position(|i| i.path == "src").unwrap();
-        let components_global_idx = app.items.iter().position(|i| i.path == "src/components").unwrap();
+        let components_global_idx = app
+            .items
+            .iter()
+            .position(|i| i.path == "src/components")
+            .unwrap();
 
         // Select 'src' (filtered index 1 -> global index of 'src')
-        app.selected_item_index = app.filtered_item_indices.iter().position(|&idx| idx == src_global_idx).unwrap();
+        app.selected_item_index = app
+            .filtered_item_indices
+            .iter()
+            .position(|&idx| idx == src_global_idx)
+            .unwrap();
         let current_item_global_idx = app.filtered_item_indices[app.selected_item_index];
         assert_eq!(app.items[current_item_global_idx].path, "src");
         assert!(!app.items[current_item_global_idx].is_expanded);
@@ -566,13 +628,16 @@ mod tests {
         let mut app = create_mock_app(app_root, all_dirs, sparse_checkout, uncommitted);
         app.selected_item_index = 1; // Select 'src' (filtered index 1 -> global index of 'src')
         let src_global_idx = app.filtered_item_indices[app.selected_item_index];
-        
+
         assert_eq!(app.items[src_global_idx].path, "src");
         assert!(!app.items[src_global_idx].is_checked_out);
         assert_eq!(app.items[src_global_idx].pending_change, None);
 
         app.toggle_selection(); // Should mark 'src' for addition
-        assert_eq!(app.items[src_global_idx].pending_change, Some(ChangeType::Add));
+        assert_eq!(
+            app.items[src_global_idx].pending_change,
+            Some(ChangeType::Add)
+        );
 
         app.toggle_selection(); // Should clear pending change
         assert_eq!(app.items[src_global_idx].pending_change, None);
@@ -594,7 +659,10 @@ mod tests {
         assert_eq!(app.items[src_global_idx].pending_change, None);
 
         app.toggle_selection(); // Should mark 'src' for removal
-        assert_eq!(app.items[src_global_idx].pending_change, Some(ChangeType::Remove));
+        assert_eq!(
+            app.items[src_global_idx].pending_change,
+            Some(ChangeType::Remove)
+        );
 
         app.toggle_selection(); // Should clear pending change
         assert_eq!(app.items[src_global_idx].pending_change, None);
