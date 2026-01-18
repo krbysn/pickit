@@ -1,11 +1,4 @@
-mod app;
-mod git;
-
-use std::{
-    io::{self, Stdout},
-    time::Duration,
-};
-
+use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode},
     execute,
@@ -21,8 +14,27 @@ use ratatui::{
     widgets::{Block, Borders, Cell, List, ListItem, ListState, Row, Table},
     Terminal,
 };
+use std::{error::Error, io::Stdout, path::PathBuf, time::Duration};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+mod app;
+mod git;
+
+/// A TUI for git sparse-checkout.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// The path to the git repository.
+    #[arg()]
+    path: Option<PathBuf>,
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let cli = Cli::parse();
+
+    if let Some(path) = cli.path {
+        std::env::set_current_dir(path)?;
+    }
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
