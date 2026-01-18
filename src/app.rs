@@ -118,6 +118,20 @@ impl App {
 
     /// Refreshes the application state by re-reading the git repository.
     fn refresh(&mut self) -> Result<(), git::Error> {
+        // --- State Preservation (Before Refresh) ---
+        let selected_path_before_refresh = self.filtered_item_indices
+            .get(self.selected_item_index)
+            .and_then(|&global_idx| self.items.get(global_idx))
+            .map(|item| item.path.clone());
+
+        let expanded_paths_before_refresh: Vec<String> = self.items
+            .iter()
+            .filter(|item| item.is_expanded)
+            .map(|item| item.path.clone())
+            .collect();
+        // --- End State Preservation ---
+
+
         let all_dirs = git::get_all_dirs()?;
         let sparse_checkout_dirs = match git::get_sparse_checkout_list() {
             Ok(list) => list,
@@ -210,13 +224,37 @@ impl App {
             }
         }
 
+        // Restore expanded state and find new selected item global index
+        let mut new_selected_item_global_idx = 0;
+        for (i, item) in final_items.iter_mut().enumerate() {
+            if expanded_paths_before_refresh.contains(&item.path) {
+                item.is_expanded = true;
+            }
+            if let Some(ref path) = selected_path_before_refresh {
+                if item.path == *path {
+                    new_selected_item_global_idx = i;
+                }
+            }
+        }
+
         if !final_items.is_empty() && final_items[0].path == "." {
-            final_items[0].is_expanded = true;
+            final_items[0].is_expanded = true; // Ensure root is expanded initially
         }
 
         self.items = final_items;
         self.build_visible_items();
-        self.selected_item_index = 0; // Reset cursor
+
+        // Restore selected item index (now an index into filtered_item_indices)
+        if let Some(new_selected_filtered_idx) = self.filtered_item_indices
+            .iter()
+            .position(|&global_idx| global_idx == new_selected_item_global_idx) {
+            self.selected_item_index = new_selected_filtered_idx;
+        } else {
+            self.selected_item_index = 0; // Fallback if selected item is no longer visible
+        }
+        
+        // Scroll state is implicitly handled by `selected_item_index` and TUI's rendering of `ListState`
+        // No explicit `scroll_offset` restoration is typically needed for Ratatui list.
         Ok(())
     }
 
