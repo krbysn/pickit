@@ -110,11 +110,10 @@ fn run_app(
             f.render_widget(footer_block, footer_area);
         })?;
 
+        #[allow(clippy::collapsible_if)]
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if KeyCode::Char('q') == key.code {
-                    return Ok(());
-                }
+            if let Event::Key(key) = event::read()? && key.code == KeyCode::Char('q') {
+                return Ok(());
             }
         }
     }

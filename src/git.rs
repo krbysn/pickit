@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use thiserror::Error;
 
@@ -49,10 +49,10 @@ pub fn get_all_dirs() -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn has_uncommitted_changes(path: &PathBuf) -> Result<bool> {
+pub fn has_uncommitted_changes(path: &Path) -> Result<bool> {
     let path_str = path.to_string_lossy();
-    let output = dbg!(run_git_command(&["status", "--porcelain", path_str.as_ref()]))?;
-    Ok(dbg!(!output.trim().is_empty()))
+    let output = run_git_command(&["status", "--porcelain", path_str.as_ref()])?;
+    Ok(!output.trim().is_empty())
 }
 
 #[cfg(test)]

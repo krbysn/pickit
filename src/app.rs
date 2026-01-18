@@ -1,7 +1,8 @@
 use crate::git;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::{Path, PathBuf}};
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[allow(dead_code)] // Will be used when applying changes
 pub enum ChangeType {
     Add,
     Remove,
@@ -14,7 +15,9 @@ pub struct TreeItem {
     pub children_indices: Vec<usize>, // Indices of direct children in the App's items vec
     pub parent_index: Option<usize>,
     pub is_expanded: bool,
+    #[allow(dead_code)] // Read in PR #4 (TUI integration)
     pub is_checked_out: bool,
+    #[allow(dead_code)] // Read in PR #4 (TUI integration)
     pub pending_change: Option<ChangeType>,
     pub is_locked: bool,                      // If this item cannot be deselected
     pub contains_uncommitted_changes: bool, // For determining `is_locked`
@@ -42,6 +45,7 @@ pub struct App {
     pub current_repo_root: PathBuf,
     pub items: Vec<TreeItem>, // Flat list of all directories
     pub filtered_item_indices: Vec<usize>, // Indices of items currently visible in the TUI
+    #[allow(dead_code)] // Read in PR #4 (TUI integration)
     pub selected_item_index: usize, // Index into `filtered_item_indices`
     #[allow(dead_code)] // Will be used for TUI scrolling
     pub scroll_offset: usize, // For scrolling the TUI view
@@ -49,6 +53,7 @@ pub struct App {
     pub last_git_error: Option<String>, // To display transient git errors
 }
 
+#[allow(dead_code)] // Functions are used by tests, but will be used by TUI in PR #4
 impl App {
     pub fn new() -> Result<Self, git::Error> {
         let current_repo_root = git::find_repo_root()?;
@@ -85,7 +90,7 @@ impl App {
                     .to_string()
             };
             
-            let contains_uncommitted_changes = git::has_uncommitted_changes(&PathBuf::from(&dir_path))?;
+            let contains_uncommitted_changes = git::has_uncommitted_changes(Path::new(&dir_path))?;
             let is_locked = contains_uncommitted_changes || dir_path == "."; // Lock root and any dir with changes
 
             let mut item = TreeItem::new(dir_path.clone(), name, is_checked_out);
@@ -111,20 +116,16 @@ impl App {
         // Second pass to populate children_indices
         let mut final_items = items.clone(); 
         for (i, item) in items.iter().enumerate() {
-            if let Some(parent_idx) = item.parent_index {
-                if parent_idx < final_items.len() {
-                    final_items[parent_idx].children_indices.push(i);
-                }
+            if let Some(parent_idx) = item.parent_index && parent_idx < final_items.len() {
+                final_items[parent_idx].children_indices.push(i);
             }
         }
         items = final_items;
 
 
         // Always expand the root node, if it exists
-        if let Some(root_item) = items.get_mut(0) {
-            if root_item.path == "." {
-                root_item.is_expanded = true;
-            }
+        if let Some(root_item) = items.get_mut(0) && root_item.path == "." {
+            root_item.is_expanded = true;
         }
 
         let mut app = App {
