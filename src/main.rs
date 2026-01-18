@@ -18,14 +18,14 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     text::Line,
-    widgets::{Block, Borders, List, ListItem, ListState},
+    widgets::{Block, Borders, Cell, List, ListItem, ListState, Row, Table},
     Terminal,
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
     enable_raw_mode()?;
-    let mut stdout = io::stdout();
+    let mut stdout = std::io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -91,24 +91,48 @@ fn run_app(
             let tree_items_vm = app.get_tui_tree_items();
             let tree_items: Vec<ListItem> = tree_items_vm
                 .into_iter()
-                .map(|vm| {
-                    ListItem::new(Line::from(vm.display_text)).style(vm.style)
-                })
+                .map(|vm| ListItem::new(Line::from(vm.display_text)).style(vm.style))
                 .collect();
 
             list_state.select(Some(app.selected_item_index));
 
-            let tree_list = List::new(tree_items)
-                .block(Block::default().borders(Borders::ALL).title(" Tree View "));
-            
+            let tree_list =
+                List::new(tree_items).block(Block::default().borders(Borders::ALL).title(" Tree View "));
+
             f.render_stateful_widget(tree_list, tree_area, &mut list_state);
 
-
             // --- Grid View ---
-            let grid_block = Block::default()
-                .borders(Borders::ALL)
-                .title(" Grid View ");
-            f.render_widget(grid_block, grid_area);
+            let grid_title = " Grid View ";
+            if let Some(grid_vm) = app.get_grid_view_model() {
+                let rows = vec![
+                    Row::new(vec![Cell::new("Name"), Cell::new(grid_vm.name)]),
+                    Row::new(vec![Cell::new("Path"), Cell::new(grid_vm.path)]),
+                    Row::new(vec![Cell::new("Status"), Cell::new(grid_vm.status)]),
+                    Row::new(vec![Cell::new("Uncommitted"), Cell::new(grid_vm.uncommitted)]),
+                    Row::new(vec![
+                        Cell::new("Subdirectories (Total)"),
+                        Cell::new(grid_vm.subdirectories_total),
+                    ]),
+                    Row::new(vec![
+                        Cell::new("Subdirectories (Checked Out)"),
+                        Cell::new(grid_vm.subdirectories_checked_out),
+                    ]),
+                    Row::new(vec![
+                        Cell::new("Pending Changes"),
+                        Cell::new(grid_vm.pending_changes),
+                    ]),
+                ];
+
+                let table = Table::new(
+                    rows,
+                    &[Constraint::Percentage(50), Constraint::Percentage(50)],
+                )
+                .block(Block::default().borders(Borders::ALL).title(grid_title));
+                f.render_widget(table, grid_area);
+            } else {
+                let grid_block = Block::default().borders(Borders::ALL).title(grid_title);
+                f.render_widget(grid_block, grid_area);
+            }
 
             // --- Footer ---
             let footer_block = Block::default()

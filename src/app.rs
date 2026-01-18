@@ -15,6 +15,17 @@ pub struct TuiTreeItemViewModel {
     pub style: Style,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GridViewModel {
+    pub name: String,
+    pub path: String,
+    pub status: String,
+    pub uncommitted: String,
+    pub subdirectories_total: String,
+    pub subdirectories_checked_out: String,
+    pub pending_changes: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct TreeItem {
     pub path: String,
@@ -58,6 +69,58 @@ pub struct App {
 }
 
 impl App {
+    /// Counts pending changes recursively starting from a given item index.
+    fn count_pending_changes_recursive(&self, item_index: usize) -> u32 {
+        let item = &self.items[item_index];
+        let mut count = if item.pending_change.is_some() { 1 } else { 0 };
+
+        for &child_index in &item.children_indices {
+            count += self.count_pending_changes_recursive(child_index);
+        }
+
+        count
+    }
+
+    pub fn get_grid_view_model(&self) -> Option<GridViewModel> {
+        self.filtered_item_indices
+            .get(self.selected_item_index)
+            .map(|&global_idx| {
+                let item = &self.items[global_idx];
+
+                let status = if item.is_locked {
+                    "Locked".to_string()
+                } else if item.is_checked_out {
+                    "Checked Out".to_string()
+                } else {
+                    "Not Checked Out".to_string()
+                };
+
+                let uncommitted = if item.contains_uncommitted_changes {
+                    "Yes".to_string()
+                } else {
+                    "No".to_string()
+                };
+
+                let subdirectories_checked_out = item
+                    .children_indices
+                    .iter()
+                    .filter(|&&child_idx| self.items[child_idx].is_checked_out)
+                    .count();
+                
+                let pending_changes = self.count_pending_changes_recursive(global_idx);
+
+                GridViewModel {
+                    name: item.name.clone(),
+                    path: item.path.clone(),
+                    status,
+                    uncommitted,
+                    subdirectories_total: item.children_indices.len().to_string(),
+                    subdirectories_checked_out: subdirectories_checked_out.to_string(),
+                    pending_changes: pending_changes.to_string(),
+                }
+            })
+    }
+
     pub fn get_tui_tree_items(&self) -> Vec<TuiTreeItemViewModel> {
         self.filtered_item_indices
             .iter()
