@@ -1,6 +1,6 @@
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen,
@@ -160,18 +160,20 @@ fn run_app(
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                // It's important to clear the error on any key press
-                app.last_git_error = None;
-                
-                match key.code {
-                    KeyCode::Char('q') => return Ok(()),
-                    KeyCode::Up => app.move_cursor_up(),
-                    KeyCode::Down => app.move_cursor_down(),
-                    KeyCode::Left => app.toggle_expansion(),
-                    KeyCode::Right => app.toggle_expansion(),
-                    KeyCode::Char(' ') => app.toggle_selection(),
-                    KeyCode::Char('a') => app.apply_changes(),
-                    _ => {}
+                if key.kind == KeyEventKind::Press {
+                    // It's important to clear the error on any key press
+                    app.last_git_error = None;
+                    
+                    match key.code {
+                        KeyCode::Char('q') => return Ok(()),
+                        KeyCode::Up => app.move_cursor_up(),
+                        KeyCode::Down => app.move_cursor_down(),
+                        KeyCode::Left => app.toggle_expansion(),
+                        KeyCode::Right => app.toggle_expansion(),
+                        KeyCode::Char(' ') => app.toggle_selection(),
+                        KeyCode::Char('a') => app.apply_changes(),
+                        _ => {}
+                    }
                 }
             }
         }
