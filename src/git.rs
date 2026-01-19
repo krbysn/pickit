@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use thiserror::Error;
 
@@ -49,10 +49,19 @@ pub fn get_all_dirs() -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn has_uncommitted_changes(path: &Path) -> Result<bool> {
-    let path_str = path.to_string_lossy();
-    let output = run_git_command(&["status", "--porcelain", path_str.as_ref()])?;
-    Ok(!output.trim().is_empty())
+use std::collections::HashSet;
+
+pub fn get_uncommitted_paths() -> Result<HashSet<PathBuf>> {
+    let output = run_git_command(&["status", "--porcelain=v1"])?;
+    let paths = output
+        .lines()
+        .filter_map(|line| {
+            // Each line is like "XY <path>" or "?? <path>"
+            // We need to grab the path part after the status codes
+            line.split_whitespace().last().map(PathBuf::from)
+        })
+        .collect();
+    Ok(paths)
 }
 
 pub fn set_sparse_checkout_dirs(dirs: Vec<String>) -> Result<()> {
@@ -179,29 +188,29 @@ mod tests {
     }
 
     #[test]
-    fn test_has_uncommitted_changes() {
-        let (repo_path, _temp_dir) = setup_git_repo(); // Capture _temp_dir
+    fn test_get_uncommitted_paths() {
+        let (repo_path, _temp_dir) = setup_git_repo();
         create_and_commit_files(&repo_path);
 
-        // No changes
+        // Temporarily change directory for the test
         let original_dir = std::env::current_dir().unwrap();
         std::env::set_current_dir(&repo_path).unwrap();
-        dbg!(has_uncommitted_changes(&PathBuf::from(".")).unwrap());
-        assert!(!has_uncommitted_changes(&PathBuf::from(".")).unwrap());
-        dbg!(has_uncommitted_changes(&PathBuf::from("src")).unwrap());
-        assert!(!has_uncommitted_changes(&PathBuf::from("src")).unwrap());
-        std::env::set_current_dir(&original_dir).unwrap();
 
+        // No changes initially
+        let changes = get_uncommitted_paths().unwrap();
+        assert!(changes.is_empty());
 
-        // With changes
-        fs::write(repo_path.join("src/main.rs"), "fn main() { println!(\"Hello\"); }").unwrap();
-        std::env::set_current_dir(&repo_path).unwrap();
-        dbg!(has_uncommitted_changes(&PathBuf::from(".")).unwrap());
-        assert!(has_uncommitted_changes(&PathBuf::from(".")).unwrap());
-        dbg!(has_uncommitted_changes(&PathBuf::from("src")).unwrap());
-        assert!(has_uncommitted_changes(&PathBuf::from("src")).unwrap());
-        dbg!(has_uncommitted_changes(&PathBuf::from("docs")).unwrap());
-        assert!(!has_uncommitted_changes(&PathBuf::from("docs")).unwrap()); // No changes in docs
+        // Create a new untracked file
+        fs::write(repo_path.join("untracked.txt"), "untracked").unwrap();
+        // Modify an existing file
+        fs::write(repo_path.join("src/main.rs"), "fn main() { /* changed */ }").unwrap();
+
+        let changes = get_uncommitted_paths().unwrap();
+        assert_eq!(changes.len(), 2);
+        assert!(changes.contains(&PathBuf::from("untracked.txt")));
+        assert!(changes.contains(&PathBuf::from("src/main.rs")));
+
+        // Restore original directory
         std::env::set_current_dir(&original_dir).unwrap();
     }
 }
