@@ -7,6 +7,7 @@ use crossterm::{
         LeaveAlternateScreen,
     },
 };
+use notify::{RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
@@ -14,7 +15,14 @@ use ratatui::{
     widgets::{Block, Borders, Cell, List, ListItem, ListState, Row, Table},
     Terminal,
 };
-use std::{error::Error, io, io::Stdout, path::PathBuf, time::Duration};
+use std::{
+    error::Error,
+    io,
+    io::Stdout,
+    path::PathBuf,
+    sync::mpsc::{self, Receiver},
+    time::Duration,
+};
 
 mod app;
 mod git;
@@ -28,12 +36,56 @@ struct Cli {
     path: Option<PathBuf>,
 }
 
+// Event types for main loop
+enum InputEvent {
+    Input(Event),
+    FileChange,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
     if let Some(path) = cli.path {
         std::env::set_current_dir(path)?;
     }
+
+    // --- Watch for file changes in a separate thread ---
+    let (tx, rx) = mpsc::channel();
+    let mut watcher: RecommendedWatcher =
+        notify::recommended_watcher(move |res: NotifyResult<notify::Event>| {
+            if let Ok(_) = res {
+                // Send a simple notification, ignoring potential errors if the receiver is disconnected.
+                if let Err(_) = tx.send(()) {
+                    // The receiver is gone, so we can't send the message.
+                    // This is expected when the application is closing.
+                }
+            }
+        })?;
+
+    if let Ok(repo_root) = git::find_repo_root() {
+        let paths_to_watch = [
+            (repo_root.join(".git/HEAD"), RecursiveMode::NonRecursive),
+            (repo_root.join(".git/index"), RecursiveMode::NonRecursive),
+            (
+                repo_root.join(".git/info/sparse-checkout"),
+                RecursiveMode::NonRecursive,
+            ),
+            (
+                repo_root.join(".git/refs/heads"),
+                RecursiveMode::Recursive,
+            ),
+        ];
+
+        for (path, mode) in paths_to_watch {
+            if path.exists() {
+                if let Err(e) = watcher.watch(&path, mode) {
+                    eprintln!("Failed to watch {}: {}", path.display(), e);
+                }
+            }
+        }
+    }
+    // The watcher needs to be kept alive, but we don't need to interact with it directly
+    // after this. It will live in the main thread's scope.
 
     // Setup terminal
     enable_raw_mode()?;
@@ -52,7 +104,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let res = run_app(&mut terminal, &mut app);
+    let res = run_app(&mut terminal, &mut app, rx);
 
     // Restore terminal
     restore_terminal(&mut terminal)?;
@@ -74,6 +126,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut app::App,
+    file_change_receiver: Receiver<()>,
 ) -> io::Result<()> {
     let mut list_state = ListState::default();
 
@@ -108,8 +161,8 @@ fn run_app(
 
             list_state.select(Some(app.selected_item_index));
 
-            let tree_list =
-                List::new(tree_items).block(Block::default().borders(Borders::ALL).title(" Tree View "));
+            let tree_list = List::new(tree_items)
+                .block(Block::default().borders(Borders::ALL).title(" Tree View "));
 
             f.render_stateful_widget(tree_list, tree_area, &mut list_state);
 
@@ -120,7 +173,10 @@ fn run_app(
                     Row::new(vec![Cell::new("Name"), Cell::new(grid_vm.name)]),
                     Row::new(vec![Cell::new("Path"), Cell::new(grid_vm.path)]),
                     Row::new(vec![Cell::new("Status"), Cell::new(grid_vm.status)]),
-                    Row::new(vec![Cell::new("Uncommitted"), Cell::new(grid_vm.uncommitted)]),
+                    Row::new(vec![
+                        Cell::new("Uncommitted"),
+                        Cell::new(grid_vm.uncommitted),
+                    ]),
                     Row::new(vec![
                         Cell::new("Subdirectories (Total)"),
                         Cell::new(grid_vm.subdirectories_total),
@@ -150,31 +206,47 @@ fn run_app(
             let footer_text = if let Some(err) = &app.last_git_error {
                 err.clone()
             } else {
-                " [↑/↓] Navigate [→/←] Expand/Collapse [Space] Toggle [a] Apply [q] Quit ".to_string()
+                " [↑/↓] Navigate [→/←] Expand/Collapse [Space] Toggle [a] Apply [q] Quit "
+                    .to_string()
             };
-            let footer_block = Block::default()
-                .borders(Borders::ALL)
-                .title(footer_text);
+            let footer_block = Block::default().borders(Borders::ALL).title(footer_text);
             f.render_widget(footer_block, footer_area);
         })?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    // It's important to clear the error on any key press
-                    app.last_git_error = None;
-                    
-                    match key.code {
-                        KeyCode::Char('q') => return Ok(()),
-                        KeyCode::Up => app.move_cursor_up(),
-                        KeyCode::Down => app.move_cursor_down(),
-                        KeyCode::Left => app.toggle_expansion(),
-                        KeyCode::Right => app.toggle_expansion(),
-                        KeyCode::Char(' ') => app.toggle_selection(),
-                        KeyCode::Char('a') => app.apply_changes(),
-                        _ => {}
+        // Wait for next event, either from keyboard or file watcher
+        let event = if event::poll(Duration::from_millis(100))? {
+            Some(InputEvent::Input(event::read()?))
+        } else if file_change_receiver.try_recv().is_ok() {
+            Some(InputEvent::FileChange)
+        } else {
+            None
+        };
+
+        if let Some(input_event) = event {
+            match input_event {
+                InputEvent::FileChange => {
+                    if let Err(e) = app.refresh() {
+                        app.last_git_error = Some(format!("Refresh failed: {}", e));
                     }
                 }
+                InputEvent::Input(Event::Key(key)) => {
+                    if key.kind == KeyEventKind::Press {
+                        // It's important to clear the error on any key press
+                        app.last_git_error = None;
+
+                        match key.code {
+                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Up => app.move_cursor_up(),
+                            KeyCode::Down => app.move_cursor_down(),
+                            KeyCode::Left => app.toggle_expansion(),
+                            KeyCode::Right => app.toggle_expansion(),
+                            KeyCode::Char(' ') => app.toggle_selection(),
+                            KeyCode::Char('a') => app.apply_changes(),
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {} // Other events like mouse, resize etc.
             }
         }
     }

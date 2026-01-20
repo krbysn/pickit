@@ -117,7 +117,7 @@ impl App {
     }
 
     /// Refreshes the application state by re-reading the git repository.
-    fn refresh(&mut self) -> Result<(), git::Error> {
+    pub fn refresh(&mut self) -> Result<(), git::Error> {
         // --- State Preservation (Before Refresh) ---
         let selected_path_before_refresh = self.filtered_item_indices
             .get(self.selected_item_index)
