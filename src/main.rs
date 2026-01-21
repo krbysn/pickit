@@ -238,8 +238,11 @@ fn run_app(
                             KeyCode::Char('q') => return Ok(()),
                             KeyCode::Up => app.move_cursor_up(),
                             KeyCode::Down => app.move_cursor_down(),
-                            KeyCode::Left => app.toggle_expansion(),
-                            KeyCode::Right => app.toggle_expansion(),
+                            KeyCode::Left | KeyCode::Right => {
+                                if let Err(e) = app.toggle_expansion() {
+                                    app.last_git_error = Some(e.to_string());
+                                }
+                            }
                             KeyCode::Char(' ') => app.toggle_selection(),
                             KeyCode::Char('a') => app.apply_changes(),
                             _ => {}
