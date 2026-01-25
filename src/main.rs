@@ -11,10 +11,12 @@ use notify::{RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher}
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, Cell, List, ListItem, ListState, Row, Table},
+    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Clear, Row, Table},
     Terminal,
 };
+use ratatui::layout::{Alignment, Rect};
 use std::{
     error::Error,
     io,
@@ -40,6 +42,7 @@ struct Cli {
 enum InputEvent {
     Input(Event),
     FileChange,
+    App(app::AppMessage), // New variant for App-specific messages
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -95,7 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run it
-    let mut app = match app::App::new() {
+    let mut app = match app::App::new(None) {
         Ok(app) => app,
         Err(e) => {
             eprintln!("Error initializing application: {}", e);
@@ -131,97 +134,131 @@ fn run_app(
     let mut list_state = ListState::default();
 
     loop {
-        terminal.draw(|f| {
-            let size = f.area();
-
-            // Define main layout (main_area + footer)
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(0), Constraint::Length(3)])
-                .split(size);
-
-            let main_area = chunks[0];
-            let footer_area = chunks[1];
-
-            // Split main_area into tree (left) and grid (right)
-            let main_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(main_area);
-
-            let tree_area = main_chunks[0];
-            let grid_area = main_chunks[1];
-
-            // --- Tree View ---
-            let tree_items_vm = app.get_tui_tree_items();
-            let tree_items: Vec<ListItem> = tree_items_vm
-                .into_iter()
-                .map(|vm| ListItem::new(Line::from(vm.display_text)).style(vm.style))
-                .collect();
-
-            list_state.select(Some(app.selected_item_index));
-
-            let tree_list = List::new(tree_items)
-                .block(Block::default().borders(Borders::ALL).title(" Tree View "));
-
-            f.render_stateful_widget(tree_list, tree_area, &mut list_state);
-
-            // --- Grid View ---
-            let grid_title = " Grid View ";
-            if let Some(grid_vm) = app.get_grid_view_model() {
-                let rows = vec![
-                    Row::new(vec![Cell::new("Name"), Cell::new(grid_vm.name)]),
-                    Row::new(vec![Cell::new("Path"), Cell::new(grid_vm.path)]),
-                    Row::new(vec![Cell::new("Status"), Cell::new(grid_vm.status)]),
-                    Row::new(vec![
-                        Cell::new("Uncommitted"),
-                        Cell::new(grid_vm.uncommitted),
-                    ]),
-                    Row::new(vec![
-                        Cell::new("Subdirectories (Total)"),
-                        Cell::new(grid_vm.subdirectories_total),
-                    ]),
-                    Row::new(vec![
-                        Cell::new("Subdirectories (Checked Out)"),
-                        Cell::new(grid_vm.subdirectories_checked_out),
-                    ]),
-                    Row::new(vec![
-                        Cell::new("Pending Changes"),
-                        Cell::new(grid_vm.pending_changes),
-                    ]),
-                ];
-
-                let table = Table::new(
-                    rows,
-                    &[Constraint::Percentage(50), Constraint::Percentage(50)],
-                )
-                .block(Block::default().borders(Borders::ALL).title(grid_title));
-                f.render_widget(table, grid_area);
-            } else {
-                let grid_block = Block::default().borders(Borders::ALL).title(grid_title);
-                f.render_widget(grid_block, grid_area);
-            }
-
-            // --- Footer ---
-            let footer_text = if let Some(err) = &app.last_git_error {
-                err.clone()
-            } else {
-                " [↑/↓] Navigate [→/←] Expand/Collapse [Space] Toggle [a] Apply [q] Quit "
-                    .to_string()
-            };
-            let footer_block = Block::default().borders(Borders::ALL).title(footer_text);
-            f.render_widget(footer_block, footer_area);
-        })?;
-
-        // Wait for next event, either from keyboard or file watcher
-        let event = if event::poll(Duration::from_millis(100))? {
+        let event = if event::poll(Duration::from_millis(10))? {
             Some(InputEvent::Input(event::read()?))
-        } else if file_change_receiver.try_recv().is_ok() {
-            Some(InputEvent::FileChange)
         } else {
-            None
+            // Always try to receive from app.rx first, then file_change_receiver
+            match app.rx.try_recv() {
+                Ok(app_msg) => Some(InputEvent::App(app_msg)),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("App message sender disconnected.");
+                    None
+                },
+                Err(mpsc::TryRecvError::Empty) => {
+                    if file_change_receiver.try_recv().is_ok() {
+                        Some(InputEvent::FileChange)
+                    } else {
+                        None // No events from any source
+                    }
+                }
+            }
         };
 
+        terminal.draw(|f| {
+            if app.is_applying_changes {
+                // Render a loading screen
+                let size = f.area();
+                let block = Block::default()
+                    .title("Applying Changes")
+                    .borders(Borders::ALL);
+                let paragraph = Paragraph::new("Applying changes... Please wait.")
+                    .style(Style::default().fg(Color::White).bg(Color::Black))
+                    .alignment(Alignment::Center)
+                    .block(block);
+
+                let area = Rect::new(
+                    size.width / 4,
+                    size.height / 3,
+                    size.width / 2,
+                    size.height / 6,
+                );
+                f.render_widget(Clear, area); // Clear the area
+                f.render_widget(paragraph, area);
+            } else {
+                // Render the main TUI
+                let size = f.area();
+
+                // Define main layout (main_area + footer)
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Min(0), Constraint::Length(3)])
+                    .split(size);
+
+                let main_area = chunks[0];
+                let footer_area = chunks[1];
+
+                // Split main_area into tree (left) and grid (right)
+                let main_chunks = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+                    .split(main_area);
+
+                let tree_area = main_chunks[0];
+                let grid_area = main_chunks[1];
+
+                // --- Tree View ---
+                let tree_items_vm = app.get_tui_tree_items();
+                let tree_items: Vec<ListItem> = tree_items_vm
+                    .into_iter()
+                    .map(|vm| ListItem::new(Line::from(vm.display_text)).style(vm.style))
+                    .collect();
+
+                list_state.select(Some(app.selected_item_index));
+
+                let tree_list = List::new(tree_items)
+                    .block(Block::default().borders(Borders::ALL).title(" Tree View "));
+
+                f.render_stateful_widget(tree_list, tree_area, &mut list_state);
+
+                // --- Grid View ---
+                let grid_title = " Grid View ";
+                if let Some(grid_vm) = app.get_grid_view_model() {
+                    let rows = vec![
+                        Row::new(vec![Cell::new("Name"), Cell::new(grid_vm.name)]),
+                        Row::new(vec![Cell::new("Path"), Cell::new(grid_vm.path)]),
+                        Row::new(vec![Cell::new("Status"), Cell::new(grid_vm.status)]),
+                        Row::new(vec![
+                            Cell::new("Uncommitted"),
+                            Cell::new(grid_vm.uncommitted),
+                        ]),
+                        Row::new(vec![
+                            Cell::new("Subdirectories (Total)"),
+                            Cell::new(grid_vm.subdirectories_total),
+                        ]),
+                        Row::new(vec![
+                            Cell::new("Subdirectories (Checked Out)"),
+                            Cell::new(grid_vm.subdirectories_checked_out),
+                        ]),
+                        Row::new(vec![
+                            Cell::new("Pending Changes"),
+                            Cell::new(grid_vm.pending_changes),
+                        ]),
+                    ];
+
+                    let table = Table::new(
+                        rows,
+                        &[Constraint::Percentage(50), Constraint::Percentage(50)],
+                    )
+                    .block(Block::default().borders(Borders::ALL).title(grid_title));
+                    f.render_widget(table, grid_area);
+                } else {
+                    let grid_block = Block::default().borders(Borders::ALL).title(grid_title);
+                    f.render_widget(grid_block, grid_area);
+                }
+
+                // --- Footer ---
+                let footer_text = if let Some(err) = &app.last_git_error {
+                    err.clone()
+                } else {
+                    " [↑/↓] Navigate [→/←] Expand/Collapse [Space] Toggle [a] Apply [q] Quit "
+                        .to_string()
+                };
+                let footer_block = Block::default().borders(Borders::ALL).title(footer_text);
+                f.render_widget(footer_block, footer_area);
+            }
+        })?; // Correctly closes the terminal.draw call
+
+        // Process keyboard input if any
         if let Some(input_event) = event {
             match input_event {
                 InputEvent::FileChange => {
@@ -246,6 +283,27 @@ fn run_app(
                             KeyCode::Char(' ') => app.toggle_selection(),
                             KeyCode::Char('a') => app.apply_changes(),
                             _ => {}
+                        }
+                    }
+                }
+                InputEvent::App(app_msg) => {
+                    match app_msg {
+                        app::AppMessage::ApplyChangesCompleted(result) => {
+                            app.is_applying_changes = false; // Reset the flag
+                            match result {
+                                Ok(_) => {
+                                    // Clear pending changes on all items (this was moved from App::apply_changes)
+                                    for item in app.items.iter_mut() {
+                                        item.pending_change = None;
+                                    }
+                                    if let Err(e) = app.refresh() {
+                                        app.last_git_error = Some(format!("Refresh failed: {}", e));
+                                    }
+                                }
+                                Err(e) => {
+                                    app.last_git_error = Some(e.to_string());
+                                }
+                            }
                         }
                     }
                 }

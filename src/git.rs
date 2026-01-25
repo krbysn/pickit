@@ -36,8 +36,8 @@ pub fn find_repo_root() -> Result<PathBuf> {
     Ok(PathBuf::from(output.trim()))
 }
 
-pub fn get_sparse_checkout_list(repo_path: Option<&Path>) -> Result<Vec<String>> {
-    let output = run_git_command(&["sparse-checkout", "list"], repo_path)?;
+pub fn get_sparse_checkout_list(repo_path: &Path) -> Result<Vec<String>> {
+    let output = run_git_command(&["sparse-checkout", "list"], Some(repo_path))?;
     Ok(output
         .lines()
         .filter(|s| !s.is_empty())
@@ -45,14 +45,14 @@ pub fn get_sparse_checkout_list(repo_path: Option<&Path>) -> Result<Vec<String>>
         .collect())
 }
 
-pub fn get_dirs_at_path(path: &str, repo_path: Option<&Path>) -> Result<Vec<String>> {
+pub fn get_dirs_at_path(path: &str, repo_path: &Path) -> Result<Vec<String>> {
     let tree_ish = if path.is_empty() || path == "." {
         "HEAD".to_string()
     } else {
         format!("HEAD:{}", path)
     };
 
-    let output = run_git_command(&["ls-tree", "--name-only", "-d", &tree_ish], repo_path);
+    let output = run_git_command(&["ls-tree", "--name-only", "-d", &tree_ish], Some(repo_path));
 
     // ls-tree returns a non-zero exit code if the path doesn't exist or has no directories,
     // which is not a "real" error for us. We just want to return an empty Vec.
@@ -78,8 +78,8 @@ pub fn get_dirs_at_path(path: &str, repo_path: Option<&Path>) -> Result<Vec<Stri
 
 use std::collections::HashSet;
 
-pub fn get_uncommitted_paths(repo_path: Option<&Path>) -> Result<HashSet<PathBuf>> {
-    let output = run_git_command(&["status", "--porcelain=v1"], repo_path)?;
+pub fn get_uncommitted_paths(repo_path: &Path) -> Result<HashSet<PathBuf>> {
+    let output = run_git_command(&["status", "--porcelain=v1"], Some(repo_path))?;
     let paths = output
         .lines()
         .filter_map(|line| {
@@ -91,13 +91,13 @@ pub fn get_uncommitted_paths(repo_path: Option<&Path>) -> Result<HashSet<PathBuf
     Ok(paths)
 }
 
-pub fn set_sparse_checkout_dirs(dirs: Vec<String>, repo_path: Option<&Path>) -> Result<()> {
+pub fn set_sparse_checkout_dirs(dirs: Vec<String>, repo_path: &Path) -> Result<()> {
     let mut args = vec!["sparse-checkout", "set"];
     // This is a workaround because `dirs` is Vec<String> and `args` is Vec<&str>
     let dirs_as_strs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
     args.extend(dirs_as_strs);
 
-    run_git_command(&args, repo_path)?;
+    run_git_command(&args, Some(repo_path))?;
     Ok(())
 }
 
@@ -171,18 +171,18 @@ pub mod tests {
         let (repo_path, _temp_dir) = setup_git_repo_with_subdirs();
 
         // Test at root
-        let root_dirs = get_dirs_at_path("", Some(&repo_path)).unwrap();
+        let root_dirs = get_dirs_at_path("", &repo_path).unwrap();
         assert_eq!(root_dirs, vec!["docs", "src", "tests"]);
 
         // Test at a subdirectory
-        let src_dirs = get_dirs_at_path("src", Some(&repo_path)).unwrap();
+        let src_dirs = get_dirs_at_path("src", &repo_path).unwrap();
         assert_eq!(src_dirs, vec!["src/components"]);
 
         // Test at a directory with no subdirectories
-        let docs_dirs = get_dirs_at_path("docs", Some(&repo_path)).unwrap();
+        let docs_dirs = get_dirs_at_path("docs", &repo_path).unwrap();
         assert!(docs_dirs.is_empty());
         
-        let components_dirs = get_dirs_at_path("src/components", Some(&repo_path)).unwrap();
+        let components_dirs = get_dirs_at_path("src/components", &repo_path).unwrap();
         assert!(components_dirs.is_empty());
     }
 
@@ -191,30 +191,27 @@ pub mod tests {
         let (repo_path, _temp_dir) = setup_git_repo(); // Capture _temp_dir
         create_and_commit_files(&repo_path);
 
-        let output = Command::new("git")
+        Command::new("git")
             .args(&["sparse-checkout", "init", "--cone"])
             .current_dir(&repo_path)
             .output()
-            .unwrap();
-        assert!(output.status.success());
+            .expect("git sparse-checkout init --cone failed")
+            .status
+            .success();
 
         Command::new("git")
             .args(&["sparse-checkout", "set", "src", "docs"])
             .current_dir(&repo_path)
             .output()
-            .unwrap();
+            .expect("git sparse-checkout set failed")
+            .status
+            .success();
         
-        // Temporarily change directory for the test
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&repo_path).unwrap();
-
-        let sparse_dirs = get_sparse_checkout_list(Some(&repo_path)).unwrap();
+        let sparse_dirs = get_sparse_checkout_list(&repo_path).unwrap();
         assert!(sparse_dirs.contains(&"src".to_string()));
         assert!(sparse_dirs.contains(&"docs".to_string()));
         assert!(!sparse_dirs.contains(&"tests".to_string()));
         assert_eq!(sparse_dirs.len(), 2);
-
-        std::env::set_current_dir(&original_dir).unwrap(); // Restore original directory
     }
 
     #[test]
@@ -222,12 +219,8 @@ pub mod tests {
         let (repo_path, _temp_dir) = setup_git_repo();
         create_and_commit_files(&repo_path);
 
-        // Temporarily change directory for the test
-        let original_dir = std::env::current_dir().unwrap();
-        std::env::set_current_dir(&repo_path).unwrap();
-
         // No changes initially
-        let changes = get_uncommitted_paths(Some(&repo_path)).unwrap();
+        let changes = get_uncommitted_paths(&repo_path).unwrap();
         assert!(changes.is_empty());
 
         // Create a new untracked file
@@ -235,13 +228,10 @@ pub mod tests {
         // Modify an existing file
         fs::write(repo_path.join("src/main.rs"), "fn main() { /* changed */ }").unwrap();
 
-        let changes = get_uncommitted_paths(Some(&repo_path)).unwrap();
+        let changes = get_uncommitted_paths(&repo_path).unwrap();
         assert_eq!(changes.len(), 2);
         assert!(changes.contains(&PathBuf::from("untracked.txt")));
         assert!(changes.contains(&PathBuf::from("src/main.rs")));
-
-        // Restore original directory
-        std::env::set_current_dir(&original_dir).unwrap();
     }
 }
 

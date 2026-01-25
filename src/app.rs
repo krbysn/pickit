@@ -4,7 +4,14 @@ use ratatui::style::{Color, Style};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
+    sync::mpsc, // Add this import
+    thread,
 };
+
+// Define messages that can be sent from background threads to the main thread
+pub enum AppMessage {
+    ApplyChangesCompleted(Result<(), git::Error>),
+}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ChangeType {
@@ -76,6 +83,10 @@ pub struct App {
     #[allow(dead_code)] // Will be used for TUI scrolling
     pub scroll_offset: usize, // For scrolling the TUI view
     pub last_git_error: Option<String>,    // To display transient git errors
+    pub is_applying_changes: bool, // New field to indicate if changes are being applied
+    pub tx: mpsc::Sender<AppMessage>, // Sender for background tasks to send messages to App
+    #[allow(dead_code)] // Will be used by the main loop
+    pub rx: mpsc::Receiver<AppMessage>, // Receiver for App to get messages from background tasks
     
     // Cached git state
     pub sparse_checkout_dirs: Vec<String>,
@@ -92,6 +103,9 @@ impl Default for App {
             selected_item_index: 0,
             scroll_offset: 0,
             last_git_error: None,
+            is_applying_changes: false, // Initialize new field
+            tx: mpsc::channel().0, // Initialize sender (dummy, will be replaced in App::new)
+            rx: mpsc::channel().1, // Initialize receiver (dummy, will be replaced in App::new)
             sparse_checkout_dirs: Vec::new(),
             uncommitted_paths: std::collections::HashSet::new(),
         }
@@ -100,7 +114,7 @@ impl Default for App {
 
 impl App {
     fn load_initial_tree(&mut self) -> Result<(), git::Error> {
-        self.sparse_checkout_dirs = match git::get_sparse_checkout_list(Some(&self.current_repo_root)) {
+        self.sparse_checkout_dirs = match git::get_sparse_checkout_list(&self.current_repo_root) {
             Ok(list) => list,
             Err(git::Error::GitCommand(err_msg))
                 if err_msg.contains("fatal: this worktree is not sparse") =>
@@ -109,7 +123,7 @@ impl App {
             }
             Err(e) => return Err(e),
         };
-        self.uncommitted_paths = git::get_uncommitted_paths(Some(&self.current_repo_root))?;
+        self.uncommitted_paths = git::get_uncommitted_paths(&self.current_repo_root)?;
 
         // --- Build Initial Tree ---
         self.items.clear();
@@ -129,7 +143,7 @@ impl App {
         self.path_to_index.insert(".".to_string(), 0);
 
         // 2. Load Top-Level Dirs
-        let top_level_dirs = git::get_dirs_at_path(".", Some(&self.current_repo_root))?;
+        let top_level_dirs = git::get_dirs_at_path(".", &self.current_repo_root)?;
         for dir_path_str in top_level_dirs.into_iter().sorted() {
             let dir_path = Path::new(&dir_path_str);
             let name = dir_path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -151,8 +165,11 @@ impl App {
         Ok(())
     }
 
-    /// Applies the pending changes to the git sparse-checkout set.
+    /// Applies the pending changes to the git sparse-checkout set in a separate thread.
     pub fn apply_changes(&mut self) {
+        self.is_applying_changes = true;
+        self.last_git_error = None; // Clear previous errors
+
         let dirs_to_checkout: Vec<String> = self
             .items
             .iter()
@@ -176,31 +193,24 @@ impl App {
             })
             .collect();
 
-        match git::set_sparse_checkout_dirs(dirs_to_checkout, Some(&self.current_repo_root)) {
-            Ok(_) => {
-                // Clear pending changes on all items
-                for item in self.items.iter_mut() {
-                    item.pending_change = None;
-                }
+        // Capture necessary variables for the thread
+        let repo_root = self.current_repo_root.clone();
+        let tx_clone = self.tx.clone();
 
-                // Clear any previous error and refresh the state
-                self.last_git_error = None;
-                if self.refresh().is_err() {
-                    // If refreshing fails, we should probably note that
-                    self.last_git_error =
-                        Some("Failed to refresh state after applying changes.".to_string());
-                }
-            }
-            Err(e) => {
-                self.last_git_error = Some(e.to_string());
-            }
-        }
+        // Spawn a new thread to perform the potentially long-running git operation
+        thread::spawn(move || {
+            let result = git::set_sparse_checkout_dirs(dirs_to_checkout, &repo_root);
+            // Send the result back to the main thread
+            let _ = tx_clone.send(AppMessage::ApplyChangesCompleted(result));
+        });
+
+        // The main thread returns immediately, letting the TUI continue to render.
     }
 
     /// Refreshes the application state by re-reading the git repository.
     pub fn refresh(&mut self) -> Result<(), git::Error> {
         // --- Fetch latest git state ---
-        self.sparse_checkout_dirs = match git::get_sparse_checkout_list(Some(&self.current_repo_root)) {
+        self.sparse_checkout_dirs = match git::get_sparse_checkout_list(&self.current_repo_root) {
             Ok(list) => list,
             Err(git::Error::GitCommand(err_msg))
                 if err_msg.contains("fatal: this worktree is not sparse") =>
@@ -209,7 +219,7 @@ impl App {
             }
             Err(e) => return Err(e),
         };
-        self.uncommitted_paths = git::get_uncommitted_paths(Some(&self.current_repo_root))?;
+        self.uncommitted_paths = git::get_uncommitted_paths(&self.current_repo_root)?;
 
         // --- Update all loaded items in-place ---
         for i in 0..self.items.len() {
@@ -378,10 +388,16 @@ impl App {
             .collect()
     }
 
-    pub fn new() -> Result<Self, git::Error> {
-        let current_repo_root = git::find_repo_root()?;
+    pub fn new(repo_path: Option<&PathBuf>) -> Result<Self, git::Error> {
+        let current_repo_root = match repo_path {
+            Some(path) => path.clone(),
+            None => git::find_repo_root()?,
+        };
+        let (tx, rx) = mpsc::channel(); // Create the channel
         let mut app = App {
             current_repo_root,
+            tx, // Assign the sender
+            rx, // Assign the receiver
             ..Default::default()
         };
         app.load_initial_tree()?;
@@ -428,7 +444,7 @@ impl App {
             // Load children if they haven't been loaded yet.
             if !self.items[global_idx].children_loaded {
                 let item_path = self.items[global_idx].path.clone();
-                let sub_dirs = git::get_dirs_at_path(&item_path, Some(&self.current_repo_root))?;
+                let sub_dirs = git::get_dirs_at_path(&item_path, &self.current_repo_root)?;
 
                 if !sub_dirs.is_empty() {
                     for dir_path_str in sub_dirs.into_iter().sorted() {
@@ -521,9 +537,8 @@ mod tests {
     fn test_toggle_expansion_loads_children() {
         // This test needs to run in a temporary git repo.
         let (repo_path, _temp_dir) = crate::git::tests::setup_git_repo_with_subdirs();
-        std::env::set_current_dir(&repo_path).unwrap();
 
-        let mut app = App::new().expect("App initialization failed");
+        let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
 
         // --- Initial State Checks ---
         // Ensure initial items are loaded and sorted correctly
@@ -563,6 +578,55 @@ mod tests {
 
         // The *correct* order should be: [root, docs, src, src/components, tests]
         // The actual assertion for the fix will check for this.
+    }
+
+    #[test]
+    fn test_apply_changes_progress_flag() {
+        // Setup a temporary git repo
+        let (repo_path, _temp_dir) = crate::git::tests::setup_git_repo_with_subdirs();
+
+        let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
+
+        // Ensure initially no changes are being applied
+        assert!(!app.is_applying_changes, "Initially, is_applying_changes should be false");
+
+        // Simulate a pending change: mark 'src' for addition
+        let src_global_idx = app.items.iter().position(|i| i.path == "src").unwrap();
+        app.items[src_global_idx].pending_change = Some(ChangeType::Add);
+        
+        // Assert that the pending change is registered
+        assert_eq!(app.items[src_global_idx].pending_change, Some(ChangeType::Add));
+
+        // Apply changes
+        app.apply_changes();
+
+        // After apply_changes, app.is_applying_changes is still true
+        assert!(app.is_applying_changes, "Immediately after apply_changes, is_applying_changes should be true");
+
+        // Simulate main loop processing the message
+        let app_msg = app.rx.recv().expect("Should receive a message from apply_changes");
+        match app_msg {
+            AppMessage::ApplyChangesCompleted(result) => {
+                app.is_applying_changes = false; // Manually reset as main loop would
+                result.expect("Apply changes should succeed in test");
+                // Clear pending changes on all items, as the main loop would
+                for item in app.items.iter_mut() {
+                    item.pending_change = None;
+                }
+                // Refresh the app state as the main loop would
+                app.refresh().expect("App refresh should succeed");
+            }
+        }
+        
+        // After processing the message, the flag should be reset to false
+        assert!(!app.is_applying_changes, "After processing message, is_applying_changes should be false");
+
+        // Verify that 'src' is now checked out
+        let sparse_checkout_list = git::get_sparse_checkout_list(&repo_path).unwrap();
+        assert!(sparse_checkout_list.contains(&"src".to_string()), "'src' should be in the sparse-checkout list");
+        
+        // Also verify the pending_change was cleared
+        assert_eq!(app.items[src_global_idx].pending_change, None, "Pending change for 'src' should be cleared");
     }
 }
     
