@@ -100,8 +100,7 @@ impl Default for App {
 
 impl App {
     fn load_initial_tree(&mut self) -> Result<(), git::Error> {
-        // --- Fetch Git Data ---
-        self.sparse_checkout_dirs = match git::get_sparse_checkout_list() {
+        self.sparse_checkout_dirs = match git::get_sparse_checkout_list(Some(&self.current_repo_root)) {
             Ok(list) => list,
             Err(git::Error::GitCommand(err_msg))
                 if err_msg.contains("fatal: this worktree is not sparse") =>
@@ -110,7 +109,7 @@ impl App {
             }
             Err(e) => return Err(e),
         };
-        self.uncommitted_paths = git::get_uncommitted_paths()?;
+        self.uncommitted_paths = git::get_uncommitted_paths(Some(&self.current_repo_root))?;
 
         // --- Build Initial Tree ---
         self.items.clear();
@@ -130,7 +129,7 @@ impl App {
         self.path_to_index.insert(".".to_string(), 0);
 
         // 2. Load Top-Level Dirs
-        let top_level_dirs = git::get_dirs_at_path(".")?;
+        let top_level_dirs = git::get_dirs_at_path(".", Some(&self.current_repo_root))?;
         for dir_path_str in top_level_dirs.into_iter().sorted() {
             let dir_path = Path::new(&dir_path_str);
             let name = dir_path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -177,7 +176,7 @@ impl App {
             })
             .collect();
 
-        match git::set_sparse_checkout_dirs(dirs_to_checkout) {
+        match git::set_sparse_checkout_dirs(dirs_to_checkout, Some(&self.current_repo_root)) {
             Ok(_) => {
                 // Clear pending changes on all items
                 for item in self.items.iter_mut() {
@@ -201,7 +200,7 @@ impl App {
     /// Refreshes the application state by re-reading the git repository.
     pub fn refresh(&mut self) -> Result<(), git::Error> {
         // --- Fetch latest git state ---
-        self.sparse_checkout_dirs = match git::get_sparse_checkout_list() {
+        self.sparse_checkout_dirs = match git::get_sparse_checkout_list(Some(&self.current_repo_root)) {
             Ok(list) => list,
             Err(git::Error::GitCommand(err_msg))
                 if err_msg.contains("fatal: this worktree is not sparse") =>
@@ -210,7 +209,7 @@ impl App {
             }
             Err(e) => return Err(e),
         };
-        self.uncommitted_paths = git::get_uncommitted_paths()?;
+        self.uncommitted_paths = git::get_uncommitted_paths(Some(&self.current_repo_root))?;
 
         // --- Update all loaded items in-place ---
         for i in 0..self.items.len() {
@@ -390,25 +389,22 @@ impl App {
         Ok(app)
     }
 
+    fn build_visible_items_recursive(items: &Vec<TreeItem>, item_idx: usize, visible_indices: &mut Vec<usize>) {
+        visible_indices.push(item_idx);
+
+        let item = &items[item_idx];
+        if item.is_expanded {
+            for &child_idx in &item.children_indices {
+                Self::build_visible_items_recursive(items, child_idx, visible_indices);
+            }
+        }
+    }
+    
     // Helper to rebuild the list of currently visible items in the TUI
     fn build_visible_items(&mut self) {
         self.filtered_item_indices.clear();
-        for i in 0..self.items.len() {
-            let _item = &self.items[i]; // Changed 'item' to '_item'
-
-            // Corrected logic: Check if all its ancestors are expanded
-            let mut current_idx = i;
-            let mut is_visible = true;
-            while let Some(parent_idx) = self.items[current_idx].parent_index {
-                if !self.items[parent_idx].is_expanded {
-                    is_visible = false;
-                    break;
-                }
-                current_idx = parent_idx;
-            }
-            if is_visible {
-                self.filtered_item_indices.push(i);
-            }
+        if !self.items.is_empty() {
+            Self::build_visible_items_recursive(&self.items, 0, &mut self.filtered_item_indices);
         }
     }
 
@@ -432,7 +428,7 @@ impl App {
             // Load children if they haven't been loaded yet.
             if !self.items[global_idx].children_loaded {
                 let item_path = self.items[global_idx].path.clone();
-                let sub_dirs = git::get_dirs_at_path(&item_path)?;
+                let sub_dirs = git::get_dirs_at_path(&item_path, Some(&self.current_repo_root))?;
 
                 if !sub_dirs.is_empty() {
                     for dir_path_str in sub_dirs.into_iter().sorted() {
@@ -529,36 +525,44 @@ mod tests {
 
         let mut app = App::new().expect("App initialization failed");
 
-        // Initially, we should have the root and top-level dirs.
-        // The exact number depends on the test repo setup.
-        // Let's find 'src' and expand it.
-        let src_initial_index = app.items.iter().position(|i| i.path == "src");
-        assert!(src_initial_index.is_some(), "'src' directory not found in initial items");
-        let src_initial_index = src_initial_index.unwrap();
+        // --- Initial State Checks ---
+        // Ensure initial items are loaded and sorted correctly
+        let root_idx = app.items.iter().position(|i| i.path == ".").unwrap();
+        let docs_idx = app.items.iter().position(|i| i.path == "docs").unwrap();
+        let src_idx = app.items.iter().position(|i| i.path == "src").unwrap();
+        let tests_idx = app.items.iter().position(|i| i.path == "tests").unwrap(); // Assuming 'tests' is also a top-level dir
 
-        assert!(!app.items[src_initial_index].children_loaded, "Children of 'src' should not be loaded yet");
-        assert!(app.items[src_initial_index].children_indices.is_empty(), "Children indices of 'src' should be empty before loading");
+        // Initial top-level items are alphabetically sorted in `items`
+        // and also in `filtered_item_indices` since no children are expanded yet.
+        assert_eq!(app.filtered_item_indices, vec![root_idx, docs_idx, src_idx, tests_idx]);
 
         // Select 'src' in the filtered list
-        app.selected_item_index = app.filtered_item_indices.iter().position(|&i| i == src_initial_index).unwrap();
+        app.selected_item_index = app.filtered_item_indices.iter().position(|&i| i == src_idx).unwrap();
+
+        assert!(!app.items[src_idx].children_loaded, "Children of 'src' should not be loaded yet");
+        assert!(app.items[src_idx].children_indices.is_empty(), "Children indices of 'src' should be empty before loading");
 
         // Expand 'src'
         app.toggle_expansion().unwrap();
 
-        // After expansion, children should be loaded
-        let src_item = &app.items[src_initial_index];
+        // --- After Expansion Checks ---
+        let src_item = &app.items[src_idx];
         assert!(src_item.children_loaded, "Children of 'src' should be loaded after expansion");
         assert!(!src_item.children_indices.is_empty(), "Children indices of 'src' should not be empty after loading");
         assert!(src_item.is_expanded, "'src' should be marked as expanded");
 
         // Check if the children (e.g., 'src/components') are now in the items list
-        let has_components = app.items.iter().any(|i| i.path == "src/components");
-        assert!(has_components, "'src/components' should be in the items list after expanding 'src'");
+        let components_idx = app.items.iter().position(|i| i.path == "src/components");
+        assert!(components_idx.is_some(), "'src/components' should be in the items list after expanding 'src'");
+        let components_idx = components_idx.unwrap();
 
-        // Check if 'src/components' is now visible in the filtered list
-        let components_global_idx = app.items.iter().position(|i| i.path == "src/components").unwrap();
-        let is_visible = app.filtered_item_indices.contains(&components_global_idx);
-        assert!(is_visible, "'src/components' should be visible after expanding 'src'");
+        // Verify the filtered_item_indices order to expose the bug
+        // The *correct* order should be: [root, docs, src, src/components, tests]
+        let expected_correct_order = vec![root_idx, docs_idx, src_idx, components_idx, tests_idx];
+        assert_eq!(app.filtered_item_indices, expected_correct_order, "Filtered items order is incorrect after fix");
+
+        // The *correct* order should be: [root, docs, src, src/components, tests]
+        // The actual assertion for the fix will check for this.
     }
 }
     
