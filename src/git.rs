@@ -191,7 +191,7 @@ pub mod tests {
         let (repo_path, _temp_dir) = setup_git_repo(); // Capture _temp_dir
         create_and_commit_files(&repo_path);
 
-        Command::new("git")
+        let _ = Command::new("git")
             .args(&["sparse-checkout", "init", "--cone"])
             .current_dir(&repo_path)
             .output()
@@ -199,7 +199,7 @@ pub mod tests {
             .status
             .success();
 
-        Command::new("git")
+        let _ = Command::new("git")
             .args(&["sparse-checkout", "set", "src", "docs"])
             .current_dir(&repo_path)
             .output()
