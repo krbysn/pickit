@@ -306,6 +306,9 @@ fn run_app(
                         app::AppMessage::ChildrenLoaded(result) => {
                             app.handle_children_loaded(result);
                         }
+                        app::AppMessage::SparseCheckoutListLoaded(result) => {
+                            app.handle_sparse_checkout_list_loaded(result);
+                        }
                     }
                 }
                 _ => {} // Other events like mouse, resize etc.
