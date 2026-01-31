@@ -16,4 +16,4 @@ thiserror = "2.0.17"
 tempfile = "3.24.0"
 
 [profile.release]
-debug = true
+debug = "line-tables-only"

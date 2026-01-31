@@ -11,6 +11,7 @@ use std::{
 // Define messages that can be sent from background threads to the main thread
 pub enum AppMessage {
     ApplyChangesCompleted(Result<(), git::Error>),
+    ChildrenLoaded(Result<(usize, Vec<String>), git::Error>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -51,6 +52,7 @@ pub struct TreeItem {
     pub contains_uncommitted_changes: bool, // For determining `is_locked`
     pub has_checked_out_descendant: bool,
     pub is_implicitly_checked_out: bool,
+    pub is_loading: bool,
 }
 
 impl TreeItem {
@@ -68,6 +70,7 @@ impl TreeItem {
             contains_uncommitted_changes: false,
             has_checked_out_descendant: false,
             is_implicitly_checked_out: false, // Initialize new field
+            is_loading: false,                // Initialize new field
         }
     }
 }
@@ -113,6 +116,65 @@ impl Default for App {
 }
 
 impl App {
+    pub fn handle_children_loaded(
+        &mut self,
+        result: Result<(usize, Vec<String>), git::Error>,
+    ) {
+        match result {
+            Ok((parent_idx, sub_dirs)) => {
+                let parent_item = &mut self.items[parent_idx];
+                parent_item.is_loading = false;
+                parent_item.children_loaded = true;
+
+                if !sub_dirs.is_empty() {
+                    for dir_path_str in sub_dirs.into_iter().sorted() {
+                        if self.path_to_index.contains_key(&dir_path_str) {
+                            continue;
+                        }
+
+                        let dir_path = Path::new(&dir_path_str);
+                        let name = dir_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        let is_checked_out = self.sparse_checkout_dirs.contains(&dir_path_str);
+
+                        let contains_uncommitted_changes = self
+                            .uncommitted_paths
+                            .iter()
+                            .any(|p| p.starts_with(&dir_path_str));
+                        let is_locked = contains_uncommitted_changes;
+
+                        let mut item = TreeItem::new(dir_path_str.clone(), name, is_checked_out);
+                        item.contains_uncommitted_changes = contains_uncommitted_changes;
+                        item.is_locked = is_locked;
+                        item.parent_index = Some(parent_idx);
+
+                        let new_idx = self.items.len();
+                        self.items[parent_idx].children_indices.push(new_idx);
+                        self.path_to_index.insert(dir_path_str, new_idx);
+                        self.items.push(item);
+                    }
+                }
+                
+                let parent_item = &mut self.items[parent_idx];
+                if !parent_item.children_indices.is_empty() {
+                    parent_item.is_expanded = true;
+                }
+
+                self.update_tree_item_states();
+                self.build_visible_items();
+            }
+            Err(e) => {
+                // Find which item was loading and set its state back
+                if let Some(loading_item) = self.items.iter_mut().find(|i| i.is_loading) {
+                    loading_item.is_loading = false;
+                }
+                self.last_git_error = Some(e.to_string());
+            }
+        }
+    }
     fn update_tree_item_states(&mut self) {
         // Pass 1: Post-order traversal (from leaves up to the root) to set `has_checked_out_descendant`.
         for i in (0..self.items.len()).rev() {
@@ -128,17 +190,18 @@ impl App {
 
         // Pass 2: Pre-order traversal (from root down to leaves) to set `is_implicitly_checked_out`.
         for i in 0..self.items.len() {
-            let parent_is_effectively_checked_out = if let Some(parent_idx) = self.items[i].parent_index {
-                // Do not consider the root directory for implicit checkout logic
-                if parent_idx == 0 {
-                    false
+            let parent_is_effectively_checked_out =
+                if let Some(parent_idx) = self.items[i].parent_index {
+                    // Do not consider the root directory for implicit checkout logic
+                    if parent_idx == 0 {
+                        false
+                    } else {
+                        let parent = &self.items[parent_idx];
+                        parent.is_checked_out || parent.is_implicitly_checked_out
+                    }
                 } else {
-                    let parent = &self.items[parent_idx];
-                    parent.is_checked_out || parent.is_implicitly_checked_out
-                }
-            } else {
-                false
-            };
+                    false
+                };
 
             if parent_is_effectively_checked_out {
                 self.items[i].is_implicitly_checked_out = true;
@@ -367,17 +430,15 @@ impl App {
                     style = style.fg(Color::DarkGray);
                 }
 
-
                 // Highlight the selected item
                 if view_idx == self.selected_item_index {
                     style = style.bg(Color::Blue);
                 }
 
                 // 2. Determine Expansion Symbol
-                let expansion_symbol = if !item.children_loaded {
-                    // Optimistically show expand symbol if we haven't checked for children yet.
-                    // The exception is for locked items that are not checked out, which are unlikely to have checked-out children.
-                    // This is a heuristic and might be adjusted.
+                let expansion_symbol = if item.is_loading {
+                    "◌ " // Spinner for loading state
+                } else if !item.children_loaded {
                     "▸ "
                 } else if !item.children_indices.is_empty() {
                     if item.is_expanded {
@@ -484,75 +545,36 @@ impl App {
         }
     }
 
-    pub fn toggle_expansion(&mut self) -> Result<(), git::Error> {
+    pub fn toggle_expansion(&mut self) {
         if let Some(&global_idx) = self.filtered_item_indices.get(self.selected_item_index) {
-            // Load children if they haven't been loaded yet.
-            if !self.items[global_idx].children_loaded {
-                let item_path = self.items[global_idx].path.clone();
-                let sub_dirs = git::get_dirs_at_path(&item_path, &self.current_repo_root)?;
-
-                if !sub_dirs.is_empty() {
-                    for dir_path_str in sub_dirs.into_iter().sorted() {
-                        // Check if item already exists (can happen on refresh)
-                        if self.path_to_index.contains_key(&dir_path_str) {
-                            continue;
-                        }
-
-                        let dir_path = Path::new(&dir_path_str);
-                        let name = dir_path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        let is_checked_out = self.sparse_checkout_dirs.contains(&dir_path_str);
-
-                        // NOTE: This check is still simplified.
-                        let contains_uncommitted_changes = self
-                            .uncommitted_paths
-                            .iter()
-                            .any(|p| p.starts_with(&dir_path_str));
-                        let is_locked = contains_uncommitted_changes;
-
-                        let mut item = TreeItem::new(dir_path_str.clone(), name, is_checked_out);
-                        item.contains_uncommitted_changes = contains_uncommitted_changes;
-                        item.is_locked = is_locked;
-                        item.parent_index = Some(global_idx);
-
-                        let new_idx = self.items.len();
-                        self.items[global_idx].children_indices.push(new_idx);
-                        self.path_to_index.insert(dir_path_str, new_idx);
-                        self.items.push(item);
-                    }
-                }
-                self.items[global_idx].children_loaded = true;
-                self.update_tree_item_states();
-            }
-
-            // Now, toggle the expansion state.
             let item = &mut self.items[global_idx];
-            if !item.children_indices.is_empty() {
-                item.is_expanded = !item.is_expanded;
+
+            // If children are loaded, just toggle expansion and rebuild
+            if item.children_loaded {
+                if !item.children_indices.is_empty() {
+                    item.is_expanded = !item.is_expanded;
+                    self.build_visible_items();
+                }
+                return;
             }
 
-            self.build_visible_items();
-            // Ensure selected item index remains valid after rebuilding visible items
-            // This logic might need adjustment to keep the selection on the same item
-            if let Some(new_filtered_idx) = self
-                .filtered_item_indices
-                .iter()
-                .position(|&idx| idx == global_idx)
-            {
-                self.selected_item_index = new_filtered_idx;
-            } else {
-                // If the item disappeared (e.g., collapsing its parent), we might lose selection.
-                // For now, let's clamp it. A better solution might be to move selection to the parent.
-                self.selected_item_index = std::cmp::min(
-                    self.selected_item_index,
-                    self.filtered_item_indices.len().saturating_sub(1),
-                );
+            // If already loading, do nothing
+            if item.is_loading {
+                return;
             }
+
+            // Start loading children
+            item.is_loading = true;
+            let item_path = item.path.clone();
+            let repo_root = self.current_repo_root.clone();
+            let tx_clone = self.tx.clone();
+
+            thread::spawn(move || {
+                let result =
+                    git::get_dirs_at_path(&item_path, &repo_root).map(|dirs| (global_idx, dirs));
+                let _ = tx_clone.send(AppMessage::ChildrenLoaded(result));
+            });
         }
-        Ok(())
     }
 
     pub fn toggle_selection(&mut self) {
@@ -602,8 +624,15 @@ mod tests {
             .iter()
             .position(|&i| i == src_global_idx)
             .unwrap();
-        app.toggle_expansion()
-            .expect("Failed to expand 'src' directory");
+        app.toggle_expansion();
+        // Since expansion is now async, we need to process the message.
+        // In a test, we can do this manually.
+        let msg = app.rx.recv().unwrap();
+        if let AppMessage::ChildrenLoaded(result) = msg {
+            app.handle_children_loaded(result);
+        } else {
+            panic!("Expected ChildrenLoaded message");
+        }
 
         // 3. Get View Models
         let view_models = app.get_tui_tree_items();
@@ -687,7 +716,15 @@ mod tests {
         );
 
         // Expand 'src'
-        app.toggle_expansion().unwrap();
+        app.toggle_expansion();
+        // Since expansion is now async, we need to process the message.
+        let msg = app.rx.recv().unwrap();
+        if let AppMessage::ChildrenLoaded(result) = msg {
+            app.handle_children_loaded(result);
+        } else {
+            panic!("Expected ChildrenLoaded message");
+        }
+
 
         // --- After Expansion Checks ---
         let src_item = &app.items[src_idx];
@@ -702,7 +739,10 @@ mod tests {
         assert!(src_item.is_expanded, "'src' should be marked as expanded");
 
         // Check if the children (e.g., 'src/components') are now in the items list
-        let components_idx = app.items.iter().position(|i| i.path == "src/components");
+        let components_idx = app
+            .items
+            .iter()
+            .position(|i| i.path == "src/components");
         assert!(
             components_idx.is_some(),
             "'src/components' should be in the items list after expanding 'src'"
@@ -768,6 +808,9 @@ mod tests {
                 }
                 // Refresh the app state as the main loop would
                 app.refresh().expect("App refresh should succeed");
+            }
+            AppMessage::ChildrenLoaded(_) => {
+                panic!("Expected ApplyChangesCompleted message");
             }
         }
 
