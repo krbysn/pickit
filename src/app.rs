@@ -53,6 +53,8 @@ pub struct TreeItem {
     pub has_checked_out_descendant: bool,
     pub is_implicitly_checked_out: bool,
     pub is_loading: bool,
+    pub indentation_level: u16,
+    pub cached_pending_changes: u32,
 }
 
 impl TreeItem {
@@ -71,6 +73,8 @@ impl TreeItem {
             has_checked_out_descendant: false,
             is_implicitly_checked_out: false, // Initialize new field
             is_loading: false,                // Initialize new field
+            indentation_level: 0,
+            cached_pending_changes: 0,
         }
     }
 }
@@ -116,6 +120,34 @@ impl Default for App {
 }
 
 impl App {
+    // New helper function to recursively update cached_pending_changes
+    fn update_pending_changes_cache(&mut self, item_idx: usize) {
+        let mut current_pending_changes = 0;
+        let item = &self.items[item_idx];
+
+        // Add 1 if this item itself has a pending change
+        if item.pending_change.is_some() {
+            current_pending_changes += 1;
+        }
+
+        // Recursively sum up children's cached_pending_changes
+        for &child_idx in &item.children_indices {
+            // Children's cache must be up-to-date before it is summed here.
+            // This is ensured by calling this function bottom-up in the hierarchy.
+            current_pending_changes += self.items[child_idx].cached_pending_changes;
+        }
+
+        // Update the item's cache if it has changed
+        if self.items[item_idx].cached_pending_changes != current_pending_changes {
+            self.items[item_idx].cached_pending_changes = current_pending_changes;
+
+            // Propagate the update to the parent
+            if let Some(parent_idx) = self.items[item_idx].parent_index {
+                self.update_pending_changes_cache(parent_idx);
+            }
+        }
+    }
+
     pub fn handle_children_loaded(
         &mut self,
         result: Result<(usize, Vec<String>), git::Error>,
@@ -150,7 +182,9 @@ impl App {
                         item.contains_uncommitted_changes = contains_uncommitted_changes;
                         item.is_locked = is_locked;
                         item.parent_index = Some(parent_idx);
-
+                        item.indentation_level = self.items[parent_idx].indentation_level + 1;
+                        item.cached_pending_changes = 0;
+                        
                         let new_idx = self.items.len();
                         self.items[parent_idx].children_indices.push(new_idx);
                         self.path_to_index.insert(dir_path_str, new_idx);
@@ -165,6 +199,7 @@ impl App {
 
                 self.update_tree_item_states();
                 self.build_visible_items();
+                self.update_pending_changes_cache(parent_idx); // Update cache after adding children
             }
             Err(e) => {
                 // Find which item was loading and set its state back
@@ -238,6 +273,8 @@ impl App {
         root_item.is_locked = true;
         root_item.is_expanded = true;
         root_item.children_loaded = true;
+        root_item.indentation_level = 0; // Root is at level 0
+        root_item.cached_pending_changes = 0;
         self.items.push(root_item);
         self.path_to_index.insert(".".to_string(), 0);
 
@@ -262,13 +299,22 @@ impl App {
             item.contains_uncommitted_changes = contains_uncommitted_changes;
             item.is_locked = is_locked;
             item.parent_index = Some(0);
-
+            item.indentation_level = 1; // Direct children of root are at level 1
+            item.cached_pending_changes = 0; // Initialize to 0
+            
             let new_idx = self.items.len();
             self.items[0].children_indices.push(new_idx);
             self.path_to_index.insert(dir_path_str, new_idx);
             self.items.push(item);
         }
         self.update_tree_item_states();
+        
+        // After all initial items are loaded, update the cache from leaves up.
+        // This needs to be done once all items are in `self.items`.
+        for i in (0..self.items.len()).rev() {
+            self.update_pending_changes_cache(i);
+        }
+        
         Ok(())
     }
 
@@ -354,20 +400,16 @@ impl App {
 
         self.update_tree_item_states();
 
+        // After refresh, the pending change status might change due to external git operations,
+        // so we need to rebuild the cache for all items.
+        for i in (0..self.items.len()).rev() {
+            self.update_pending_changes_cache(i);
+        }
+        
         Ok(())
     }
 
-    /// Counts pending changes recursively starting from a given item index.
-    fn count_pending_changes_recursive(&self, item_index: usize) -> u32 {
-        let item = &self.items[item_index];
-        let mut count = if item.pending_change.is_some() { 1 } else { 0 };
 
-        for &child_index in &item.children_indices {
-            count += self.count_pending_changes_recursive(child_index);
-        }
-
-        count
-    }
 
     pub fn get_grid_view_model(&self) -> Option<GridViewModel> {
         self.filtered_item_indices
@@ -395,7 +437,7 @@ impl App {
                     .filter(|&&child_idx| self.items[child_idx].is_checked_out)
                     .count();
 
-                let pending_changes = self.count_pending_changes_recursive(global_idx);
+                let pending_changes = self.items[global_idx].cached_pending_changes;
 
                 GridViewModel {
                     name: item.name.clone(),
@@ -470,12 +512,7 @@ impl App {
                 };
 
                 // 4. Determine indentation
-                let mut current_idx = global_idx;
-                let mut indent = String::new();
-                while let Some(parent_idx) = self.items[current_idx].parent_index {
-                    indent.insert_str(0, "  ");
-                    current_idx = parent_idx;
-                }
+                let indent = "  ".repeat(item.indentation_level as usize);
 
                 let display_text = format!(
                     "{}{}{}{}",
@@ -597,6 +634,7 @@ impl App {
                     }
                 }
             };
+            self.update_pending_changes_cache(global_idx); // Update cache after toggling selection
         }
     }
 }
