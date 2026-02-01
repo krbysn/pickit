@@ -1,12 +1,10 @@
 use crate::git;
 use itertools::Itertools;
 use ratatui::style::{Color, Style};
-use std::{
-    collections::{HashMap, HashSet}, // Added HashSet here
-    path::{Path, PathBuf},
-    sync::mpsc, // Add this import
-    thread,
-};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 
 // Define messages that can be sent from background threads to the main thread
 pub enum AppMessage {
@@ -99,7 +97,7 @@ pub struct App {
 
     // Cached git state
     pub sparse_checkout_dirs: Vec<String>,
-    pub uncommitted_paths: std::collections::HashSet<PathBuf>,
+    pub uncommitted_paths: HashSet<PathBuf>,
     pub is_sparse_checkout_list_loading: bool,
 }
 
@@ -118,7 +116,7 @@ impl Default for App {
             tx: mpsc::channel().0,      // Initialize sender (dummy, will be replaced in App::new)
             rx: mpsc::channel().1,      // Initialize receiver (dummy, will be replaced in App::new)
             sparse_checkout_dirs: Vec::new(),
-            uncommitted_paths: std::collections::HashSet::new(),
+            uncommitted_paths: HashSet::new(),
             is_sparse_checkout_list_loading: false,
         }
     }
@@ -250,7 +248,21 @@ impl App {
             let has_descendant = self
                 .sparse_checkout_dirs
                 .iter()
-                .any(|sco_path| sco_path.starts_with(item_path) && sco_path != item_path);
+                .any(|sco_path| {
+                    if item_path == "." {
+                        // For the root item, any sparse checkout path that is not "." itself
+                        // indicates a checked out descendant.
+                        sco_path != "."
+                    } else {
+                        // For other items, check for true descendant paths.
+                        // `sco_path` must start with `item_path`.
+                        // `sco_path` must be longer than `item_path`.
+                        // The character immediately following `item_path` in `sco_path` must be a path separator '/'.
+                        sco_path.starts_with(item_path) &&
+                        sco_path.len() > item_path.len() &&
+                        sco_path.chars().nth(item_path.len()).map_or(false, |c| c == '/')
+                    }
+                });
             self.items[i].has_checked_out_descendant = has_descendant;
         }
 
@@ -537,7 +549,8 @@ impl App {
                     }
                 } else {
                     "  " // No children
-                };
+                }
+                ;
 
                 // 3. Determine State Symbol
                 let state_symbol = if item.is_locked {
@@ -562,8 +575,8 @@ impl App {
                 let indent = "  ".repeat(item.indentation_level as usize);
 
                 let display_text = format!(
-                    "{}{}{}{}",
-                    indent, expansion_symbol, state_symbol, item.name
+                    "{indent}{expansion_symbol}{state_symbol}{}",
+                    item.name
                 );
 
                 TuiTreeItemViewModel {
@@ -731,9 +744,6 @@ impl App {
         self.scroll_offset = std::cmp::min(self.scroll_offset.saturating_add(page_size), max_index.saturating_sub(page_size).max(0));
 
         // Ensure selected item is always visible after calculation
-        if self.selected_item_index < self.scroll_offset {
-            self.scroll_offset = self.selected_item_index;
-        }
         if self.selected_item_index >= self.scroll_offset + page_size {
             self.scroll_offset = self.selected_item_index.saturating_sub(page_size).saturating_add(1);
         }
@@ -769,7 +779,7 @@ mod tests {
     use super::*;
     use crate::git;
     use ratatui::style::Color;
-    use std::process::Command; // Added for the test
+    use std::process::Command;
 
     #[test]
     fn test_directory_state_coloring() {
@@ -934,7 +944,8 @@ mod tests {
         // The *correct* order should be: [root, docs, src, src/components, tests]
         let expected_correct_order = vec![root_idx, docs_idx, src_idx, components_idx, tests_idx];
         assert_eq!(
-            app.filtered_item_indices, expected_correct_order,
+            app.filtered_item_indices,
+            expected_correct_order,
             "Filtered items order is incorrect after fix"
         );
 
@@ -968,10 +979,7 @@ mod tests {
         app.items[src_global_idx].pending_change = Some(ChangeType::Add);
 
         // Assert that the pending change is registered
-        assert_eq!(
-            app.items[src_global_idx].pending_change,
-            Some(ChangeType::Add)
-        );
+        assert_eq!(app.items[src_global_idx].pending_change, Some(ChangeType::Add));
 
         // Apply changes
         app.apply_changes();
@@ -1020,10 +1028,7 @@ mod tests {
         );
 
         // Also verify the pending_change was cleared
-                assert_eq!(
-                    app.items[src_global_idx].pending_change, None,
-                    "Pending change for 'src' should be cleared"
-                );
+                assert_eq!(app.items[src_global_idx].pending_change, None, "Pending change for 'src' should be cleared");
             }
         
             #[test]
@@ -1107,5 +1112,78 @@ mod tests {
                 let sparse_checkout_list = git::get_sparse_checkout_list(&repo_path).unwrap();
                 assert!(sparse_checkout_list.contains(&"docs".to_string()), "'docs' should be in the sparse-checkout list after apply");
             }
-        }
+
+    #[test]
+    fn test_directory_name_inclusion_coloring() {
+        // 1. Setup Repo & Sparse Checkout
+        let (repo_path, _temp_dir) = git::tests::setup_git_repo();
         
+        // Create directories: dir1, dir100, dir2
+        std::fs::create_dir_all(repo_path.join("dir1")).unwrap();
+        std::fs::write(repo_path.join("dir1/file1.txt"), "content").unwrap();
+        std::fs::create_dir_all(repo_path.join("dir100")).unwrap();
+        std::fs::write(repo_path.join("dir100/file100.txt"), "content").unwrap();
+        std::fs::create_dir_all(repo_path.join("dir2")).unwrap();
+        std::fs::write(repo_path.join("dir2/file2.txt"), "content").unwrap();
+
+        // Commit these files
+        Command::new("git")
+            .args(&["add", "."])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(&["commit", "-m", "Add test dirs"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+
+        // Initialize sparse checkout and set dir100
+        git::set_sparse_checkout_dirs(vec!["dir100".to_string()], &repo_path)
+            .expect("Failed to set sparse checkout dirs");
+
+        // 2. Create App
+        let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
+        
+        // Process initial sparse checkout list loading
+        let msg = app.rx.recv().unwrap();
+        if let AppMessage::SparseCheckoutListLoaded(result) = msg {
+            app.handle_sparse_checkout_list_loaded(result);
+        } else {
+            panic!("Expected SparseCheckoutListLoaded message");
+        }
+
+        // 3. Get View Models
+        let view_models = app.get_tui_tree_items();
+
+        // Helper to find a view model by its name
+        let find_vm = |name: &str| {
+            view_models
+                .iter()
+                .find(|vm| vm.display_text.ends_with(name))
+                .unwrap_or_else(|| panic!("View model for '{}' not found", name))
+        };
+
+        // 4. Assert Colors
+        // `dir100` is explicitly checked out. Should be Green.
+        assert_eq!(
+            find_vm("dir100").style.fg,
+            Some(Color::Green),
+            "'dir100' should be Green"
+        );
+
+        // `dir1` is NOT checked out and NOT a descendant of `dir100`. Should be DarkGray.
+        assert_eq!(
+            find_vm("dir1").style.fg,
+            Some(Color::DarkGray),
+            "'dir1' should be DarkGray"
+        );
+
+        // `dir2` is not checked out and has no checked out descendants. Should be DarkGray.
+        assert_eq!(
+            find_vm("dir2").style.fg,
+            Some(Color::DarkGray),
+            "'dir2' should be DarkGray"
+        );
+    }
+}
