@@ -2,7 +2,7 @@ use crate::git;
 use itertools::Itertools;
 use ratatui::style::{Color, Style};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet}, // Added HashSet here
     path::{Path, PathBuf},
     sync::mpsc, // Add this import
     thread,
@@ -362,32 +362,40 @@ impl App {
         self.is_applying_changes = true;
         self.last_git_error = None; // Clear previous errors
 
-        let dirs_to_checkout: Vec<String> = self
-            .items
-            .iter()
-            .filter_map(|item| {
-                let is_currently_checked_out = item.is_checked_out;
-                let pending_change = item.pending_change;
-
-                // Determine if the item should be in the final set
-                let should_be_checked_out = match pending_change {
-                    Some(ChangeType::Add) => true,
-                    Some(ChangeType::Remove) => false,
-                    None => is_currently_checked_out,
-                };
-
-                // We only need to include directories that should be checked out
-                if should_be_checked_out && item.path != "." {
-                    Some(item.path.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        // Capture necessary variables for the thread
         let repo_root = self.current_repo_root.clone();
         let tx_clone = self.tx.clone();
+
+        // --- Bug Fix #4: Ensure all pending changes are applied correctly based on actual git state ---
+        let current_actual_sparse_list = match git::get_sparse_checkout_list(&repo_root) {
+            Ok(list) => list,
+            Err(e) => {
+                // If we can't get the current sparse list, send an error back to main thread
+                let _ = tx_clone.send(AppMessage::ApplyChangesCompleted(Err(e)));
+                return; // Exit early
+            }
+        };
+        let mut final_sparse_checkout_set: HashSet<String> = current_actual_sparse_list.into_iter().collect();
+
+        // Apply pending changes from self.items on top of the actual git state
+        for item in self.items.iter() {
+            if item.path == "." { continue; } // Root is always implicitly checked out and cannot be changed
+
+            match item.pending_change {
+                Some(ChangeType::Add) => {
+                    final_sparse_checkout_set.insert(item.path.clone());
+                }
+                Some(ChangeType::Remove) => {
+                    final_sparse_checkout_set.remove(&item.path);
+                }
+                None => { /* No pending change, its state is already reflected in `final_sparse_checkout_set` */ }
+            }
+        }
+        
+        // Convert the final set to a Vec for the git command
+        let dirs_to_checkout: Vec<String> = final_sparse_checkout_set.into_iter().collect();
+
+        // Capture necessary variables for the thread (repo_root, dirs_to_checkout, tx_clone)
+        // Note: repo_root and dirs_to_checkout are cloned for the thread's ownership.
 
         // Spawn a new thread to perform the potentially long-running git operation
         thread::spawn(move || {
@@ -761,6 +769,7 @@ mod tests {
     use super::*;
     use crate::git;
     use ratatui::style::Color;
+    use std::process::Command; // Added for the test
 
     #[test]
     fn test_directory_state_coloring() {
@@ -1050,6 +1059,53 @@ mod tests {
         
                 // Ensure no error message was set
                 assert!(app.last_git_error.is_none(), "No git error should occur for locked item toggle");
+            }
+
+            #[test]
+            fn test_apply_changes_unloaded_node() {
+                // 1. Setup Repo with subdirs and initialize sparse-checkout
+                let (repo_path, _temp_dir) = crate::git::tests::setup_git_repo_with_subdirs();
+                let _ = Command::new("git")
+                    .args(&["sparse-checkout", "init", "--cone"])
+                    .current_dir(&repo_path)
+                    .output()
+                    .expect("git sparse-checkout init --cone failed")
+                    .status
+                    .success();
+
+                // 2. Create App instance
+                let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
+
+                // Process initial sparse checkout list loading
+                let msg = app.rx.recv().unwrap();
+                if let AppMessage::SparseCheckoutListLoaded(result) = msg {
+                    app.handle_sparse_checkout_list_loaded(result);
+                } else {
+                    panic!("Expected SparseCheckoutListLoaded message");
+                }
+
+                // Find the 'docs' item (a top-level directory)
+                let docs_global_idx = app.items.iter().position(|i| i.path == "docs").unwrap();
+                assert!(!app.items[docs_global_idx].is_checked_out, "'docs' should not be checked out initially by git");
+                assert_eq!(app.items[docs_global_idx].pending_change, None, "'docs' should have no pending change initially");
+
+                // 3. Simulate selecting 'docs' for addition
+                app.items[docs_global_idx].pending_change = Some(ChangeType::Add);
+
+                // 4. Call app.apply_changes()
+                app.apply_changes();
+
+                // 5. Process the ApplyChangesCompleted message
+                let app_msg = app.rx.recv().expect("Should receive a message from apply_changes");
+                if let AppMessage::ApplyChangesCompleted(result) = app_msg {
+                    result.expect("Apply changes should succeed in test");
+                } else {
+                    panic!("Expected ApplyChangesCompleted message");
+                }
+
+                // 6. Verify that git sparse-checkout list includes 'docs'
+                let sparse_checkout_list = git::get_sparse_checkout_list(&repo_path).unwrap();
+                assert!(sparse_checkout_list.contains(&"docs".to_string()), "'docs' should be in the sparse-checkout list after apply");
             }
         }
         
