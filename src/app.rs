@@ -92,6 +92,7 @@ pub struct App {
     pub scroll_offset: usize, // For scrolling the TUI view
     pub last_git_error: Option<String>, // To display transient git errors
     pub is_applying_changes: bool, // New field to indicate if changes are being applied
+    pub is_confirming_apply_changes: bool, // New field for confirmation dialog state
     pub tx: mpsc::Sender<AppMessage>, // Sender for background tasks to send messages to App
     #[allow(dead_code)] // Will be used by the main loop
     pub rx: mpsc::Receiver<AppMessage>, // Receiver for App to get messages from background tasks
@@ -112,7 +113,8 @@ impl Default for App {
             selected_item_index: 0,
             scroll_offset: 0,
             last_git_error: None,
-            is_applying_changes: false, // Initialize new field
+            is_applying_changes: false,
+            is_confirming_apply_changes: false, // Initialize new field
             tx: mpsc::channel().0,      // Initialize sender (dummy, will be replaced in App::new)
             rx: mpsc::channel().1,      // Initialize receiver (dummy, will be replaced in App::new)
             sparse_checkout_dirs: Vec::new(),
@@ -629,35 +631,103 @@ impl App {
         }
     }
 
-    pub fn toggle_expansion(&mut self) {
+    // Helper to start loading children and expand the item
+    fn load_children_and_expand(&mut self, global_idx: usize) {
+        let item = &mut self.items[global_idx];
+
+        // If children are already loaded, just expand and rebuild
+        if item.children_loaded {
+            if !item.children_indices.is_empty() {
+                item.is_expanded = true; // Always set to true for expansion
+                self.build_visible_items();
+            }
+            return;
+        }
+
+        // If already loading, do nothing
+        if item.is_loading {
+            return;
+        }
+
+        // Start loading children
+        item.is_loading = true;
+        let item_path = item.path.clone();
+        let repo_root = self.current_repo_root.clone();
+        let tx_clone = self.tx.clone();
+
+        thread::spawn(move || {
+            let result =
+                git::get_dirs_at_path(&item_path, &repo_root).map(|dirs| (global_idx, dirs));
+            let _ = tx_clone.send(AppMessage::ChildrenLoaded(result));
+        });
+    }
+
+    pub fn expand_selected_item(&mut self) {
         if let Some(&global_idx) = self.filtered_item_indices.get(self.selected_item_index) {
             let item = &mut self.items[global_idx];
+            if !item.is_expanded { // Only expand if not already expanded
+                self.load_children_and_expand(global_idx);
+            }
+        }
+    }
 
-            // If children are loaded, just toggle expansion and rebuild
-            if item.children_loaded {
-                if !item.children_indices.is_empty() {
-                    item.is_expanded = !item.is_expanded;
-                    self.build_visible_items();
+    pub fn handle_left_key(&mut self) {
+        if let Some(&global_idx) = self.filtered_item_indices.get(self.selected_item_index) {
+            let _item_path = self.items[global_idx].path.clone(); // Clone path before getting mutable ref
+
+            // Check if the current item is expanded
+            if self.items[global_idx].is_expanded {
+                // If expanded, collapse it
+                self.items[global_idx].is_expanded = false;
+                self.build_visible_items();
+            } else {
+                // If collapsed, move to parent and collapse parent if it's open
+                if let Some(parent_idx) = self.items[global_idx].parent_index {
+                    // Update selected_item_index to point to the parent in filtered_item_indices
+                    if let Some(parent_filtered_idx) = self.filtered_item_indices.iter().position(|&idx| idx == parent_idx) {
+                        self.selected_item_index = parent_filtered_idx;
+                    }
+                    // No longer collapse the parent, just move to it.
                 }
-                return;
             }
+        }
+    }
 
-            // If already loading, do nothing
-            if item.is_loading {
-                return;
-            }
+    pub fn move_cursor_page_up(&mut self, tree_view_height: u16) {
+        if self.filtered_item_indices.is_empty() {
+            return;
+        }
 
-            // Start loading children
-            item.is_loading = true;
-            let item_path = item.path.clone();
-            let repo_root = self.current_repo_root.clone();
-            let tx_clone = self.tx.clone();
+        let page_size = tree_view_height as usize;
+        let target_index = self.selected_item_index.saturating_sub(page_size);
 
-            thread::spawn(move || {
-                let result =
-                    git::get_dirs_at_path(&item_path, &repo_root).map(|dirs| (global_idx, dirs));
-                let _ = tx_clone.send(AppMessage::ChildrenLoaded(result));
-            });
+        self.selected_item_index = target_index;
+        self.scroll_offset = self.scroll_offset.saturating_sub(page_size);
+
+        // Ensure scroll_offset doesn't go below the selected_item_index's visible start
+        if self.selected_item_index < self.scroll_offset {
+            self.scroll_offset = self.selected_item_index;
+        }
+    }
+
+    pub fn move_cursor_page_down(&mut self, tree_view_height: u16) {
+        if self.filtered_item_indices.is_empty() {
+            return;
+        }
+
+        let page_size = tree_view_height as usize;
+        let max_index = self.filtered_item_indices.len().saturating_sub(1);
+        let target_index = std::cmp::min(self.selected_item_index.saturating_add(page_size), max_index);
+
+        self.selected_item_index = target_index;
+        self.scroll_offset = std::cmp::min(self.scroll_offset.saturating_add(page_size), max_index.saturating_sub(page_size).max(0));
+
+        // Ensure selected item is always visible after calculation
+        if self.selected_item_index < self.scroll_offset {
+            self.scroll_offset = self.selected_item_index;
+        }
+        if self.selected_item_index >= self.scroll_offset + page_size {
+            self.scroll_offset = self.selected_item_index.saturating_sub(page_size).saturating_add(1);
         }
     }
 
@@ -718,7 +788,7 @@ mod tests {
             .iter()
             .position(|&i| i == src_global_idx)
             .unwrap();
-        app.toggle_expansion();
+        app.expand_selected_item(); // Changed from toggle_expansion()
         // Since expansion is now async, we need to process the message.
         // In a test, we can do this manually.
         let msg = app.rx.recv().unwrap();
@@ -818,7 +888,7 @@ mod tests {
         );
 
         // Expand 'src'
-        app.toggle_expansion();
+        app.expand_selected_item();
         // Since expansion is now async, we need to process the message.
         let msg = app.rx.recv().unwrap();
         if let AppMessage::ChildrenLoaded(result) = msg {
@@ -941,9 +1011,45 @@ mod tests {
         );
 
         // Also verify the pending_change was cleared
-        assert_eq!(
-            app.items[src_global_idx].pending_change, None,
-            "Pending change for 'src' should be cleared"
-        );
-    }
-}
+                assert_eq!(
+                    app.items[src_global_idx].pending_change, None,
+                    "Pending change for 'src' should be cleared"
+                );
+            }
+        
+            #[test]
+            fn test_toggle_selection_locked_item() {
+                // Setup a temporary git repo with uncommitted changes in 'src'
+                let (repo_path, _temp_dir) = crate::git::tests::setup_git_repo_with_subdirs();
+                // Modify a file to create uncommitted changes in 'src'
+                std::fs::write(repo_path.join("src/main.rs"), "fn main() { println!(\"Hello\"); }").unwrap();
+        
+                let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
+        
+                // Process initial sparse checkout list loading
+                let msg = app.rx.recv().unwrap();
+                if let AppMessage::SparseCheckoutListLoaded(result) = msg {
+                    app.handle_sparse_checkout_list_loaded(result);
+                } else {
+                    panic!("Expected SparseCheckoutListLoaded message");
+                }
+        
+                // Find the 'src' item and ensure it's locked
+                let src_global_idx = app.items.iter().position(|i| i.path == "src").unwrap();
+                assert!(app.items[src_global_idx].is_locked, "'src' should be locked due to uncommitted changes");
+                assert_eq!(app.items[src_global_idx].pending_change, None, "'src' should have no pending change initially");
+        
+                // Select 'src'
+                app.selected_item_index = app.filtered_item_indices.iter().position(|&i| i == src_global_idx).unwrap();
+        
+                // Attempt to toggle selection on the locked item
+                app.toggle_selection();
+        
+                // Assert that the pending_change state has NOT changed
+                assert_eq!(app.items[src_global_idx].pending_change, None, "Toggle selection on a locked item should have no effect on pending_change");
+        
+                // Ensure no error message was set
+                assert!(app.last_git_error.is_none(), "No git error should occur for locked item toggle");
+            }
+        }
+        

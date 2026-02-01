@@ -37,12 +37,23 @@ pub fn find_repo_root() -> Result<PathBuf> {
 }
 
 pub fn get_sparse_checkout_list(repo_path: &Path) -> Result<Vec<String>> {
-    let output = run_git_command(&["sparse-checkout", "list"], Some(repo_path))?;
-    Ok(output
-        .lines()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .collect())
+    match run_git_command(&["sparse-checkout", "list"], Some(repo_path)) {
+        Ok(output) => Ok(output
+            .lines()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()),
+        Err(Error::GitCommand(stderr)) => {
+            if stderr.contains("fatal: this worktree is not sparse") {
+                // If sparse-checkout is not initialized, return an empty list
+                Ok(Vec::new())
+            } else {
+                // Otherwise, propagate the error
+                Err(Error::GitCommand(stderr))
+            }
+        }
+        Err(e) => Err(e), // Propagate other types of errors
+    }
 }
 
 pub fn get_dirs_at_path(path: &str, repo_path: &Path) -> Result<Vec<String>> {
@@ -73,6 +84,15 @@ pub fn get_dirs_at_path(path: &str, repo_path: &Path) -> Result<Vec<String>> {
                 format!("{}/{}", path, s)
             }
         })
+        .collect())
+}
+
+pub fn get_all_directories_recursive(repo_path: &Path) -> Result<Vec<PathBuf>> {
+    let output = run_git_command(&["ls-tree", "-r", "--name-only", "-d", "HEAD"], Some(repo_path))?;
+    Ok(output
+        .lines()
+        .filter(|s| !s.is_empty())
+        .map(|s| PathBuf::from(s.to_string()))
         .collect())
 }
 
@@ -232,6 +252,23 @@ pub mod tests {
         assert_eq!(changes.len(), 2);
         assert!(changes.contains(&PathBuf::from("untracked.txt")));
         assert!(changes.contains(&PathBuf::from("src/main.rs")));
+    }
+
+    #[test]
+    fn test_get_all_directories_recursive() {
+        let (repo_path, _temp_dir) = setup_git_repo_with_subdirs();
+        let all_dirs = get_all_directories_recursive(&repo_path).unwrap();
+
+        let expected_dirs: HashSet<PathBuf> = [
+            PathBuf::from("docs"),
+            PathBuf::from("src"),
+            PathBuf::from("src/components"),
+            PathBuf::from("tests"),
+        ].iter().cloned().collect();
+
+        let actual_dirs: HashSet<PathBuf> = all_dirs.into_iter().collect();
+
+        assert_eq!(actual_dirs, expected_dirs);
     }
 }
 

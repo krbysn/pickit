@@ -48,8 +48,8 @@ enum InputEvent {
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
 
-    if let Some(path) = cli.path {
-        std::env::set_current_dir(path)?;
+    if let Some(path_ref) = cli.path.as_ref() {
+        std::env::set_current_dir(path_ref)?;
     }
 
     // --- Watch for file changes in a separate thread ---
@@ -98,7 +98,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run it
-    let mut app = match app::App::new(None) {
+    let mut app = match app::App::new(cli.path.as_ref()) {
         Ok(app) => app,
         Err(e) => {
             eprintln!("Error initializing application: {}", e);
@@ -174,6 +174,26 @@ fn run_app(
                 );
                 f.render_widget(Clear, area); // Clear the area
                 f.render_widget(paragraph, area);
+            } else if app.is_confirming_apply_changes {
+                // Render confirmation dialog
+                let size = f.area();
+                let confirm_block = Block::default()
+                    .title("Confirm Apply Changes")
+                    .borders(Borders::ALL)
+                    .style(Style::default().fg(Color::Yellow));
+                let confirm_text = Paragraph::new("Are you sure you want to apply changes? (y/N)")
+                    .style(Style::default().fg(Color::White))
+                    .alignment(Alignment::Center)
+                    .block(confirm_block);
+
+                let area = Rect::new(
+                    size.width / 4,
+                    size.height / 3,
+                    size.width / 2,
+                    size.height / 6,
+                );
+                f.render_widget(Clear, area);
+                f.render_widget(confirm_text, area);
             } else {
                 // Render the main TUI
                 let size = f.area();
@@ -250,7 +270,7 @@ fn run_app(
                 let footer_text = if let Some(err) = &app.last_git_error {
                     err.clone()
                 } else {
-                    " [↑/↓] Navigate [→/←] Expand/Collapse [Space] Toggle [a] Apply [q] Quit "
+                    " [q] Quit [Space] Toggle [a] Apply [↑/↓] Navigate [→] Expand [←] Coll/Parent [PgUp/Dn] Scroll "
                         .to_string()
                 };
                 let footer_block = Block::default().borders(Borders::ALL).title(footer_text);
@@ -268,19 +288,47 @@ fn run_app(
                 }
                 InputEvent::Input(Event::Key(key)) => {
                     if key.kind == KeyEventKind::Press {
-                        // It's important to clear the error on any key press
-                        app.last_git_error = None;
-
-                        match key.code {
-                            KeyCode::Char('q') => return Ok(()),
-                            KeyCode::Up => app.move_cursor_up(),
-                            KeyCode::Down => app.move_cursor_down(),
-                            KeyCode::Left | KeyCode::Right => {
-                                app.toggle_expansion();
+                        if app.is_confirming_apply_changes {
+                            // If confirmation dialog is active, handle its input
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Enter => {
+                                    app.is_confirming_apply_changes = false;
+                                    app.apply_changes(); // Proceed with changes
+                                }
+                                KeyCode::Char('n') | KeyCode::Esc => {
+                                    app.is_confirming_apply_changes = false; // Cancel
+                                }
+                                _ => {} // Ignore other keys
                             }
-                            KeyCode::Char(' ') => app.toggle_selection(),
-                            KeyCode::Char('a') => app.apply_changes(),
-                            _ => {}
+                        } else {
+                            // Clear error on any key press, only if not in confirmation mode
+                            app.last_git_error = None;
+
+                            // Normal application key handling
+                            match key.code {
+                                KeyCode::Char('q') => return Ok(()),
+                                KeyCode::Up => app.move_cursor_up(),
+                                KeyCode::Down => app.move_cursor_down(),
+                                KeyCode::PageUp => {
+                                    let tree_view_height = terminal.size()?.height.saturating_sub(3).saturating_sub(2);
+                                    app.move_cursor_page_up(tree_view_height);
+                                }
+                                KeyCode::PageDown => {
+                                    let tree_view_height = terminal.size()?.height.saturating_sub(3).saturating_sub(2);
+                                    app.move_cursor_page_down(tree_view_height);
+                                }
+                                KeyCode::Right => {
+                                    app.expand_selected_item();
+                                }
+                                KeyCode::Left => {
+                                    app.handle_left_key();
+                                }
+                                KeyCode::Char(' ') => app.toggle_selection(),
+                                KeyCode::Char('a') => {
+                                    app.is_confirming_apply_changes = true;
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }
