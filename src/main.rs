@@ -2,21 +2,18 @@ use clap::Parser;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{
-        disable_raw_mode, enable_raw_mode, EnterAlternateScreen,
-        LeaveAlternateScreen,
-    },
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use notify::{RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
+use ratatui::layout::{Alignment, Rect};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Clear, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table},
     Terminal,
 };
-use ratatui::layout::{Alignment, Rect};
 use std::{
     error::Error,
     io,
@@ -73,10 +70,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 repo_root.join(".git/info/sparse-checkout"),
                 RecursiveMode::NonRecursive,
             ),
-            (
-                repo_root.join(".git/refs/heads"),
-                RecursiveMode::Recursive,
-            ),
+            (repo_root.join(".git/refs/heads"), RecursiveMode::Recursive),
         ];
 
         for (path, mode) in paths_to_watch {
@@ -119,7 +113,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<(), Box<dyn std::error::Error>> {
+fn restore_terminal(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -143,7 +139,7 @@ fn run_app(
                 Err(mpsc::TryRecvError::Disconnected) => {
                     eprintln!("App message sender disconnected.");
                     None
-                },
+                }
                 Err(mpsc::TryRecvError::Empty) => {
                     if file_change_receiver.try_recv().is_ok() {
                         Some(InputEvent::FileChange)
@@ -153,6 +149,93 @@ fn run_app(
                 }
             }
         };
+
+        // Process keyboard input if any
+        if let Some(input_event) = event {
+            match input_event {
+                InputEvent::FileChange => {
+                    if let Err(e) = app.refresh() {
+                        app.last_git_error = Some(format!("Refresh failed: {}", e));
+                    }
+                }
+                InputEvent::Input(Event::Key(key)) => {
+                    if key.kind == KeyEventKind::Press {
+                        if app.is_confirming_apply_changes {
+                            // If confirmation dialog is active, handle its input
+                            match key.code {
+                                KeyCode::Char('y') | KeyCode::Enter => {
+                                    app.is_confirming_apply_changes = false;
+                                    app.apply_changes(); // Proceed with changes
+                                }
+                                KeyCode::Char('n') | KeyCode::Esc => {
+                                    app.is_confirming_apply_changes = false; // Cancel
+                                }
+                                _ => {} // Ignore other keys
+                            }
+                        } else {
+                            // Clear error on any key press, only if not in confirmation mode
+                            app.last_git_error = None;
+
+                            // Normal application key handling
+                            match key.code {
+                                KeyCode::Char('q') => return Ok(()),
+                                KeyCode::Up => app.move_cursor_up(),
+                                KeyCode::Down => app.move_cursor_down(),
+                                KeyCode::PageUp => {
+                                    let tree_view_height =
+                                        terminal.size()?.height.saturating_sub(3).saturating_sub(2);
+                                    app.move_cursor_page_up(tree_view_height);
+                                }
+                                KeyCode::PageDown => {
+                                    let tree_view_height =
+                                        terminal.size()?.height.saturating_sub(3).saturating_sub(2);
+                                    app.move_cursor_page_down(tree_view_height);
+                                }
+                                KeyCode::Right => {
+                                    app.expand_selected_item();
+                                }
+                                KeyCode::Left => {
+                                    app.handle_left_key();
+                                }
+                                KeyCode::Char(' ') => app.toggle_selection(),
+                                KeyCode::Char('a') => {
+                                    app.is_confirming_apply_changes = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+                InputEvent::App(app_msg) => {
+                    match app_msg {
+                        app::AppMessage::ApplyChangesCompleted(result) => {
+                            app.is_applying_changes = false; // Reset the flag
+                            match result {
+                                Ok(_) => {
+                                    // Clear pending changes on all items (this was moved from App::apply_changes)
+                                    for item in app.items.iter_mut() {
+                                        item.pending_change = None;
+                                    }
+                                    if let Err(e) = app.refresh() {
+                                        app.last_git_error = Some(format!("Refresh failed: {}", e));
+                                    }
+                                }
+                                Err(e) => {
+                                    app.last_git_error = Some(e.to_string());
+                                }
+                            }
+                        }
+                        app::AppMessage::ChildrenLoaded(result) => {
+                            app.handle_children_loaded(result);
+                        }
+                        app::AppMessage::SparseCheckoutListLoaded(result) => {
+                            app.handle_sparse_checkout_list_loaded(result);
+                        }
+                    }
+                }
+                _ => {} // Other events like mouse, resize etc.
+            }
+        }
 
         terminal.draw(|f| {
             if app.is_applying_changes {
@@ -277,90 +360,5 @@ fn run_app(
                 f.render_widget(footer_block, footer_area);
             }
         })?; // Correctly closes the terminal.draw call
-
-        // Process keyboard input if any
-        if let Some(input_event) = event {
-            match input_event {
-                InputEvent::FileChange => {
-                    if let Err(e) = app.refresh() {
-                        app.last_git_error = Some(format!("Refresh failed: {}", e));
-                    }
-                }
-                InputEvent::Input(Event::Key(key)) => {
-                    if key.kind == KeyEventKind::Press {
-                        if app.is_confirming_apply_changes {
-                            // If confirmation dialog is active, handle its input
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Enter => {
-                                    app.is_confirming_apply_changes = false;
-                                    app.apply_changes(); // Proceed with changes
-                                }
-                                KeyCode::Char('n') | KeyCode::Esc => {
-                                    app.is_confirming_apply_changes = false; // Cancel
-                                }
-                                _ => {} // Ignore other keys
-                            }
-                        } else {
-                            // Clear error on any key press, only if not in confirmation mode
-                            app.last_git_error = None;
-
-                            // Normal application key handling
-                            match key.code {
-                                KeyCode::Char('q') => return Ok(()),
-                                KeyCode::Up => app.move_cursor_up(),
-                                KeyCode::Down => app.move_cursor_down(),
-                                KeyCode::PageUp => {
-                                    let tree_view_height = terminal.size()?.height.saturating_sub(3).saturating_sub(2);
-                                    app.move_cursor_page_up(tree_view_height);
-                                }
-                                KeyCode::PageDown => {
-                                    let tree_view_height = terminal.size()?.height.saturating_sub(3).saturating_sub(2);
-                                    app.move_cursor_page_down(tree_view_height);
-                                }
-                                KeyCode::Right => {
-                                    app.expand_selected_item();
-                                }
-                                KeyCode::Left => {
-                                    app.handle_left_key();
-                                }
-                                KeyCode::Char(' ') => app.toggle_selection(),
-                                KeyCode::Char('a') => {
-                                    app.is_confirming_apply_changes = true;
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                InputEvent::App(app_msg) => {
-                    match app_msg {
-                        app::AppMessage::ApplyChangesCompleted(result) => {
-                            app.is_applying_changes = false; // Reset the flag
-                            match result {
-                                Ok(_) => {
-                                    // Clear pending changes on all items (this was moved from App::apply_changes)
-                                    for item in app.items.iter_mut() {
-                                        item.pending_change = None;
-                                    }
-                                    if let Err(e) = app.refresh() {
-                                        app.last_git_error = Some(format!("Refresh failed: {}", e));
-                                    }
-                                }
-                                Err(e) => {
-                                    app.last_git_error = Some(e.to_string());
-                                }
-                            }
-                        }
-                        app::AppMessage::ChildrenLoaded(result) => {
-                            app.handle_children_loaded(result);
-                        }
-                        app::AppMessage::SparseCheckoutListLoaded(result) => {
-                            app.handle_sparse_checkout_list_loaded(result);
-                        }
-                    }
-                }
-                _ => {} // Other events like mouse, resize etc.
-            }
-        }
     }
 }
