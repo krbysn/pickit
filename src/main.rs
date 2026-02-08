@@ -11,7 +11,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
     text::Line,
-    widgets::{Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table},
     Terminal,
 };
 use std::{
@@ -118,54 +118,40 @@ fn run_app(
 
                 InputEvent::Input(Event::Key(key)) => {
                     if key.kind == KeyEventKind::Press {
-                        if app.is_confirming_apply_changes {
-                            // If confirmation dialog is active, handle its input
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Enter => {
-                                    app.is_confirming_apply_changes = false;
-                                    app.apply_changes(); // Proceed with changes
-                                }
-                                KeyCode::Char('n') | KeyCode::Esc => {
-                                    app.is_confirming_apply_changes = false; // Cancel
-                                }
-                                _ => {} // Ignore other keys
-                            }
-                        } else {
-                            // Clear error on any key press, only if not in confirmation mode
-                            app.last_git_error = None;
+                        // Clear error on any key press
+                        app.last_git_error = None;
 
-                            // Normal application key handling
-                            match key.code {
-                                KeyCode::Char('q') => return Ok(()),
-                                KeyCode::Up => app.move_cursor_up(),
-                                KeyCode::Down => app.move_cursor_down(),
-                                KeyCode::PageUp => {
-                                    let tree_view_height =
-                                        terminal.size()?.height.saturating_sub(3).saturating_sub(2);
-                                    app.move_cursor_page_up(tree_view_height);
-                                }
-                                KeyCode::PageDown => {
-                                    let tree_view_height =
-                                        terminal.size()?.height.saturating_sub(3).saturating_sub(2);
-                                    app.move_cursor_page_down(tree_view_height);
-                                }
-                                KeyCode::Right => {
-                                    app.expand_selected_item();
-                                }
-                                KeyCode::Left => {
-                                    app.handle_left_key();
-                                }
-                                KeyCode::Char(' ') => app.toggle_selection(),
-                                KeyCode::Char('a') => {
-                                    app.is_confirming_apply_changes = true;
-                                }
-                                KeyCode::Char('r') => { // New 'r' key handling
-                                    if let Err(e) = app.refresh() {
-                                        app.last_git_error = Some(format!("Refresh failed: {}", e));
-                                    }
-                                }
-                                _ => {}
+                        // Normal application key handling
+                        match key.code {
+                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Up => app.move_cursor_up(),
+                            KeyCode::Down => app.move_cursor_down(),
+                            KeyCode::PageUp => {
+                                let tree_view_height =
+                                    terminal.size()?.height.saturating_sub(3).saturating_sub(2);
+                                app.move_cursor_page_up(tree_view_height);
                             }
+                            KeyCode::PageDown => {
+                                let tree_view_height =
+                                    terminal.size()?.height.saturating_sub(3).saturating_sub(2);
+                                app.move_cursor_page_down(tree_view_height);
+                            }
+                            KeyCode::Right => {
+                                app.expand_selected_item();
+                            }
+                            KeyCode::Left => {
+                                app.handle_left_key();
+                            }
+                            KeyCode::Char(' ') => app.toggle_selection(),
+                            KeyCode::Char('a') => {
+                                app.is_applying_changes = true; // Set flag to show loading dialog
+                                app.apply_changes(); // Directly call apply_changes
+                            }
+                            KeyCode::Char('r') => { // New 'r' key handling
+                                app.is_refreshing = true;
+                                app.refresh();
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -179,9 +165,7 @@ fn run_app(
                                     for item in app.items.iter_mut() {
                                         item.pending_change = None;
                                     }
-                                    if let Err(e) = app.refresh() {
-                                        app.last_git_error = Some(format!("Refresh failed: {}", e));
-                                    }
+                                    app.refresh(); // Now asynchronous
                                 }
                                 Err(e) => {
                                     app.last_git_error = Some(e.to_string());
@@ -190,6 +174,9 @@ fn run_app(
                         }
                         app::AppMessage::ChildrenLoaded(result) => {
                             app.handle_children_loaded(result);
+                        }
+                        app::AppMessage::RefreshCompleted(result) => {
+                            app.handle_refresh_completed(result);
                         }
 
                     }
@@ -216,19 +203,17 @@ fn run_app(
                     size.width / 2,
                     size.height / 6,
                 );
-                f.render_widget(Clear, area); // Clear the area
                 f.render_widget(paragraph, area);
-            } else if app.is_confirming_apply_changes {
-                // Render confirmation dialog
+            } else if app.is_refreshing {
+                // Render refresh loading dialog
                 let size = f.area();
-                let confirm_block = Block::default()
-                    .title("Confirm Apply Changes")
-                    .borders(Borders::ALL)
-                    .style(Style::default().fg(Color::Yellow));
-                let confirm_text = Paragraph::new("Are you sure you want to apply changes? (y/N)")
-                    .style(Style::default().fg(Color::White))
+                let block = Block::default()
+                    .title("Refreshing")
+                    .borders(Borders::ALL);
+                let paragraph = Paragraph::new("Refreshing application state... Please wait.")
+                    .style(Style::default().fg(Color::White).bg(Color::Black))
                     .alignment(Alignment::Center)
-                    .block(confirm_block);
+                    .block(block);
 
                 let area = Rect::new(
                     size.width / 4,
@@ -236,8 +221,7 @@ fn run_app(
                     size.width / 2,
                     size.height / 6,
                 );
-                f.render_widget(Clear, area);
-                f.render_widget(confirm_text, area);
+                f.render_widget(paragraph, area);
             } else {
                 // Render the main TUI
                 let size = f.area();

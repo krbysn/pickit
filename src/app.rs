@@ -10,8 +10,8 @@ use std::thread;
 pub enum AppMessage {
     ApplyChangesCompleted(Result<(), git::Error>),
     ChildrenLoaded(Result<(usize, Vec<PathBuf>), git::Error>),
-
-}
+        RefreshCompleted(Result<(Vec<PathBuf>, HashSet<PathBuf>), git::Error>),
+    }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)] // Added Hash
 pub enum ChangeType {
@@ -90,7 +90,8 @@ pub struct App {
     pub scroll_offset: usize, // For scrolling the TUI view
     pub last_git_error: Option<String>, // To display transient git errors
     pub is_applying_changes: bool, // New field to indicate if changes are being applied
-    pub is_confirming_apply_changes: bool, // New field for confirmation dialog state
+
+    pub is_refreshing: bool, // New field to indicate if a refresh is in progress
     pub tx: mpsc::Sender<AppMessage>, // Sender for background tasks to send messages to App
     #[allow(dead_code)] // Will be used by the main loop
     pub rx: mpsc::Receiver<AppMessage>, // Receiver for App to get messages from background tasks
@@ -112,7 +113,8 @@ impl Default for App {
             scroll_offset: 0,
             last_git_error: None,
             is_applying_changes: false,
-            is_confirming_apply_changes: false, // Initialize new field
+
+            is_refreshing: false, // Initialize new field
             tx: mpsc::channel().0,      // Initialize sender (dummy, will be replaced in App::new)
             rx: mpsc::channel().1,      // Initialize receiver (dummy, will be replaced in App::new)
             sparse_checkout_dirs: Vec::new(),
@@ -147,6 +149,19 @@ impl App {
             // Propagate the update to the parent
             if let Some(parent_idx) = self.items[item_idx].parent_index {
                 self.update_pending_changes_cache(parent_idx);
+            }
+        }
+    }
+
+    pub fn handle_refresh_completed(&mut self, result: Result<(Vec<PathBuf>, HashSet<PathBuf>), git::Error>) {
+        self.is_refreshing = false; // Refresh is complete
+        match result {
+            Ok((sparse_checkout_dirs, uncommitted_paths)) => {
+                self.update_state_from_git_info(sparse_checkout_dirs, uncommitted_paths);
+                self.build_visible_items(); // Rebuild visible items after state update
+            }
+            Err(e) => {
+                self.last_git_error = Some(e.to_string());
             }
         }
     }
@@ -394,16 +409,30 @@ impl App {
     }
 
     /// Refreshes the application state by re-reading the git repository.
-    /// Refreshes the application state by re-reading the git repository.
-    pub fn refresh(&mut self) -> Result<(), git::Error> {
-        // 1. Synchronously get the sparse checkout list
-        let current_sparse_checkout_list_str = git::get_sparse_checkout_list(&self.current_repo_root)?;
-        self.sparse_checkout_dirs = current_sparse_checkout_list_str.into_iter().map(PathBuf::from).collect();
+    /// Initiates an asynchronous refresh of the application state by re-reading the git repository.
+    pub fn refresh(&mut self) {
+        self.last_git_error = None; // Clear previous errors
+        let repo_root_clone = self.current_repo_root.clone();
+        let tx_clone = self.tx.clone();
 
-        // 2. Synchronously get uncommitted paths
-        self.uncommitted_paths = git::get_uncommitted_paths(&self.current_repo_root)?;
+        thread::spawn(move || {
+            let result: Result<(Vec<PathBuf>, HashSet<PathBuf>), git::Error> = (|| {
+                let current_sparse_checkout_list_str = git::get_sparse_checkout_list(&repo_root_clone)?;
+                let sparse_checkout_dirs: Vec<PathBuf> = current_sparse_checkout_list_str.into_iter().map(PathBuf::from).collect();
+                let uncommitted_paths = git::get_uncommitted_paths(&repo_root_clone)?;
+                Ok((sparse_checkout_dirs, uncommitted_paths))
+            })();
+            // Send the result back to the main thread
+            let _ = tx_clone.send(AppMessage::RefreshCompleted(result));
+        });
+    }
 
-        // 3. Update all loaded items in-place
+    // Helper function to update app state based on fetched git info
+    fn update_state_from_git_info(&mut self, new_sparse_checkout_dirs: Vec<PathBuf>, new_uncommitted_paths: HashSet<PathBuf>) {
+        self.sparse_checkout_dirs = new_sparse_checkout_dirs;
+        self.uncommitted_paths = new_uncommitted_paths;
+
+        // Update all loaded items in-place
         for i in 0..self.items.len() {
             let item = &mut self.items[i];
 
@@ -426,7 +455,7 @@ impl App {
             item.is_locked = contains_uncommitted_changes;
         }
 
-        // 4. Update tree item states and pending changes cache
+        // Update tree item states and pending changes cache
         self.update_tree_item_states();
         for i in (0..self.items.len()).rev() {
             self.update_pending_changes_cache(i);
@@ -445,8 +474,6 @@ impl App {
                 }
             }
         }
-
-        Ok(())
     }
 
     pub fn get_grid_view_model(&self) -> Option<GridViewModel> {
@@ -582,6 +609,7 @@ impl App {
             tx, // Assign the sender
             rx, // Assign the receiver
             sparse_checkout_dirs: initial_sparse_checkout_dirs, // Populated synchronously
+            is_refreshing: false, // Initialize new field
             ..Default::default()
         };
 
