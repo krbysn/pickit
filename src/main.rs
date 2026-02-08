@@ -4,7 +4,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use notify::{RecommendedWatcher, RecursiveMode, Result as NotifyResult, Watcher};
+
 use ratatui::layout::{Alignment, Rect};
 use ratatui::{
     backend::CrosstermBackend,
@@ -19,7 +19,7 @@ use std::{
     io,
     io::Stdout,
     path::PathBuf,
-    sync::mpsc::{self, Receiver},
+    sync::mpsc::{self},
     time::Duration,
 };
 
@@ -38,7 +38,7 @@ struct Cli {
 // Event types for main loop
 enum InputEvent {
     Input(Event),
-    FileChange,
+
     App(app::AppMessage), // New variant for App-specific messages
 }
 
@@ -49,40 +49,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         std::env::set_current_dir(path_ref)?;
     }
 
-    // --- Watch for file changes in a separate thread ---
-    let (tx, rx) = mpsc::channel();
-    let mut watcher: RecommendedWatcher =
-        notify::recommended_watcher(move |res: NotifyResult<notify::Event>| {
-            if let Ok(_) = res {
-                // Send a simple notification, ignoring potential errors if the receiver is disconnected.
-                if let Err(_) = tx.send(()) {
-                    // The receiver is gone, so we can't send the message.
-                    // This is expected when the application is closing.
-                }
-            }
-        })?;
 
-    if let Ok(repo_root) = git::find_repo_root() {
-        let paths_to_watch = [
-            (repo_root.join(".git/HEAD"), RecursiveMode::NonRecursive),
-            (repo_root.join(".git/index"), RecursiveMode::NonRecursive),
-            (
-                repo_root.join(".git/info/sparse-checkout"),
-                RecursiveMode::NonRecursive,
-            ),
-            (repo_root.join(".git/refs/heads"), RecursiveMode::Recursive),
-        ];
-
-        for (path, mode) in paths_to_watch {
-            if path.exists() {
-                if let Err(e) = watcher.watch(&path, mode) {
-                    eprintln!("Failed to watch {}: {}", path.display(), e);
-                }
-            }
-        }
-    }
-    // The watcher needs to be kept alive, but we don't need to interact with it directly
-    // after this. It will live in the main thread's scope.
 
     // Setup terminal
     enable_raw_mode()?;
@@ -101,7 +68,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     };
 
-    let res = run_app(&mut terminal, &mut app, rx);
+    let res = run_app(&mut terminal, &mut app);
 
     // Restore terminal
     restore_terminal(&mut terminal)?;
@@ -125,7 +92,6 @@ fn restore_terminal(
 fn run_app(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut app::App,
-    file_change_receiver: Receiver<()>,
 ) -> io::Result<()> {
     let mut list_state = ListState::default();
 
@@ -141,11 +107,7 @@ fn run_app(
                     None
                 }
                 Err(mpsc::TryRecvError::Empty) => {
-                    if file_change_receiver.try_recv().is_ok() {
-                        Some(InputEvent::FileChange)
-                    } else {
-                        None // No events from any source
-                    }
+                    None // No events from any source
                 }
             }
         };
@@ -153,11 +115,7 @@ fn run_app(
         // Process keyboard input if any
         if let Some(input_event) = event {
             match input_event {
-                InputEvent::FileChange => {
-                    if let Err(e) = app.refresh() {
-                        app.last_git_error = Some(format!("Refresh failed: {}", e));
-                    }
-                }
+
                 InputEvent::Input(Event::Key(key)) => {
                     if key.kind == KeyEventKind::Press {
                         if app.is_confirming_apply_changes {
@@ -201,6 +159,11 @@ fn run_app(
                                 KeyCode::Char('a') => {
                                     app.is_confirming_apply_changes = true;
                                 }
+                                KeyCode::Char('r') => { // New 'r' key handling
+                                    if let Err(e) = app.refresh() {
+                                        app.last_git_error = Some(format!("Refresh failed: {}", e));
+                                    }
+                                }
                                 _ => {}
                             }
                         }
@@ -228,9 +191,7 @@ fn run_app(
                         app::AppMessage::ChildrenLoaded(result) => {
                             app.handle_children_loaded(result);
                         }
-                        app::AppMessage::SparseCheckoutListLoaded(result) => {
-                            app.handle_sparse_checkout_list_loaded(result);
-                        }
+
                     }
                 }
                 _ => {} // Other events like mouse, resize etc.
@@ -353,7 +314,7 @@ fn run_app(
                 let footer_text = if let Some(err) = &app.last_git_error {
                     err.clone()
                 } else {
-                    " [q] Quit [Space] Toggle [a] Apply [↑/↓] Navigate [→] Expand [←] Coll/Parent [PgUp/Dn] Scroll "
+                    " [q] Quit [Space] Toggle [a] Apply [r] Refresh [↑/↓] Navigate [→] Expand [←] Coll/Parent [PgUp/Dn] Scroll "
                         .to_string()
                 };
                 let footer_block = Block::default().borders(Borders::ALL).title(footer_text);

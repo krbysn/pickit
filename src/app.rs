@@ -5,12 +5,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf; // Removed Path
 use std::sync::mpsc;
 use std::thread;
-git -c core.quotepath=true sparse-checkout list
+
 // Define messages that can be sent from background threads to the main thread
 pub enum AppMessage {
     ApplyChangesCompleted(Result<(), git::Error>),
     ChildrenLoaded(Result<(usize, Vec<PathBuf>), git::Error>),
-    SparseCheckoutListLoaded(Result<Vec<String>, git::Error>),
+
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)] // Added Hash
@@ -98,7 +98,7 @@ pub struct App {
     // Cached git state
     pub sparse_checkout_dirs: Vec<PathBuf>, // Changed from Vec<String>
     pub uncommitted_paths: HashSet<PathBuf>,
-    pub is_sparse_checkout_list_loading: bool,
+
 }
 
 impl Default for App {
@@ -117,7 +117,7 @@ impl Default for App {
             rx: mpsc::channel().1,      // Initialize receiver (dummy, will be replaced in App::new)
             sparse_checkout_dirs: Vec::new(),
             uncommitted_paths: HashSet::new(),
-            is_sparse_checkout_list_loading: false,
+
         }
     }
 }
@@ -151,33 +151,7 @@ impl App {
         }
     }
 
-    pub fn handle_sparse_checkout_list_loaded(
-        &mut self,
-        result: Result<Vec<String>, git::Error>,
-    ) {
-        self.is_sparse_checkout_list_loading = false;
-        match result {
-            Ok(list) => {
-                // Convert Vec<String> to Vec<PathBuf>
-                self.sparse_checkout_dirs = list.into_iter().map(PathBuf::from).collect();
-                // After sparse checkout list is loaded, update all item states
-                // This includes `is_checked_out`, `has_checked_out_descendant`, `is_implicitly_checked_out`
-                for i in 0..self.items.len() {
-                    let item = &mut self.items[i];
-                    item.is_checked_out = self.sparse_checkout_dirs.contains(&item.path); // Compare PathBuf with PathBuf
-                }
-                self.update_tree_item_states();
-                self.build_visible_items();
-                // Also re-trigger the pending changes cache update as `is_checked_out` might have changed.
-                for i in (0..self.items.len()).rev() {
-                    self.update_pending_changes_cache(i);
-                }
-            }
-            Err(e) => {
-                self.last_git_error = Some(e.to_string());
-            }
-        }
-    }
+
 
     pub fn handle_children_loaded(
         &mut self,
@@ -420,50 +394,58 @@ impl App {
     }
 
     /// Refreshes the application state by re-reading the git repository.
+    /// Refreshes the application state by re-reading the git repository.
     pub fn refresh(&mut self) -> Result<(), git::Error> {
-        self.is_sparse_checkout_list_loading = true;
-        let repo_root_clone = self.current_repo_root.clone();
-        let tx_clone = self.tx.clone();
-        thread::spawn(move || {
-            let result = git::get_sparse_checkout_list(&repo_root_clone);
-            let _ = tx_clone.send(AppMessage::SparseCheckoutListLoaded(result));
-        });
+        // 1. Synchronously get the sparse checkout list
+        let current_sparse_checkout_list_str = git::get_sparse_checkout_list(&self.current_repo_root)?;
+        self.sparse_checkout_dirs = current_sparse_checkout_list_str.into_iter().map(PathBuf::from).collect();
 
+        // 2. Synchronously get uncommitted paths
         self.uncommitted_paths = git::get_uncommitted_paths(&self.current_repo_root)?;
 
-        // --- Update all loaded items in-place ---
+        // 3. Update all loaded items in-place
         for i in 0..self.items.len() {
             let item = &mut self.items[i];
-            // item.path is now PathBuf
 
             // Root item is special
-            if item.path == PathBuf::from(".") { // Compare PathBuf
+            if item.path == PathBuf::from(".") {
                 item.is_checked_out = true;
-                item.is_locked = true;
+                item.is_locked = true; // Root is always locked
                 continue;
             }
 
-            // Update checked-out status (this will be correctly set when SparseCheckoutListLoaded is handled)
-            // For now, use existing sparse_checkout_dirs, which might be stale or empty.
-            item.is_checked_out = self.sparse_checkout_dirs.contains(&item.path); // Compare PathBuf with PathBuf
+            // Update checked-out status
+            item.is_checked_out = self.sparse_checkout_dirs.contains(&item.path);
 
             // Update lock status
             let contains_uncommitted_changes = self
                 .uncommitted_paths
                 .iter()
-                .any(|p| p.starts_with(&item.path)); // Compare PathBuf with PathBuf
+                .any(|p| p.starts_with(&item.path));
             item.contains_uncommitted_changes = contains_uncommitted_changes;
             item.is_locked = contains_uncommitted_changes;
         }
 
+        // 4. Update tree item states and pending changes cache
         self.update_tree_item_states();
-
-        // After refresh, the pending change status might change due to external git operations,
-        // so we need to rebuild the cache for all items.
         for i in (0..self.items.len()).rev() {
             self.update_pending_changes_cache(i);
         }
         
+        // After refreshing, clear any pending changes that might have been applied externally
+        for item in self.items.iter_mut() {
+            if let Some(change_type) = &item.pending_change {
+                let current_checked_out = self.sparse_checkout_dirs.contains(&item.path);
+                let needs_removal = match change_type {
+                    ChangeType::Add => current_checked_out, // If added and now checked out, clear pending
+                    ChangeType::Remove => !current_checked_out, // If removed and now not checked out, clear pending
+                };
+                if needs_removal {
+                    item.pending_change = None;
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -604,7 +586,7 @@ impl App {
         };
 
         // No need to start asynchronous loading here, as it's done synchronously above.
-        // The `SparseCheckoutListLoaded` message is still useful for `app.refresh()`.
+
 
         app.load_initial_tree()?; // Now sparse_checkout_dirs is populated here
         app.build_visible_items();
@@ -801,15 +783,6 @@ mod tests {
         // 2. Create App and expand 'src' to make the nested dir visible
         let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
         
-        // Process initial sparse checkout list loading
-        // REMOVED: No longer needed as sparse_checkout_dirs is loaded synchronously in App::new
-        // let msg = app.rx.recv().unwrap();
-        // if let AppMessage::SparseCheckoutListLoaded(result) = msg {
-        //     app.handle_sparse_checkout_list_loaded(result);
-        // } else {
-        //     panic!("Expected SparseCheckoutListLoaded message");
-        // }
-
         let src_global_idx = app.items.iter().position(|i| i.path == PathBuf::from("src")).unwrap();
         app.selected_item_index = app
             .filtered_item_indices
@@ -876,15 +849,6 @@ mod tests {
         let (repo_path, _temp_dir) = crate::git::tests::setup_git_repo_with_subdirs();
 
         let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
-
-        // Process initial sparse checkout list loading
-        // REMOVED: No longer needed as sparse_checkout_dirs is loaded synchronously in App::new
-        // let msg = app.rx.recv().unwrap();
-        // if let AppMessage::SparseCheckoutListLoaded(result) = msg {
-        //     app.handle_sparse_checkout_list_loaded(result);
-        // } else {
-        //     panic!("Expected SparseCheckoutListLoaded message");
-        // }
 
         // --- Initial State Checks ---
         // Ensure initial items are loaded and sorted correctly
@@ -970,15 +934,6 @@ mod tests {
 
         let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
 
-        // Process initial sparse checkout list loading
-        // REMOVED: No longer needed as sparse_checkout_dirs is loaded synchronously in App::new
-        // let msg = app.rx.recv().unwrap();
-        // if let AppMessage::SparseCheckoutListLoaded(result) = msg {
-        //     app.handle_sparse_checkout_list_loaded(result);
-        // } else {
-        //     panic!("Expected SparseCheckoutListLoaded message");
-        // }
-
         // Ensure initially no changes are being applied
         assert!(
             !app.is_applying_changes,
@@ -1020,10 +975,7 @@ mod tests {
             AppMessage::ChildrenLoaded(_) => {
                 panic!("Expected ApplyChangesCompleted message");
             }
-            AppMessage::SparseCheckoutListLoaded(result) => {
-                // Now SparseCheckoutListLoaded is sent by refresh, so handle it.
-                app.handle_sparse_checkout_list_loaded(result);
-            }
+
         }
 
         // After processing the message, the flag should be reset to false
@@ -1051,15 +1003,6 @@ mod tests {
         std::fs::write(repo_path.join("src/main.rs"), "fn main() { println!(\"Hello\"); }").unwrap();
 
         let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
-
-        // Process initial sparse checkout list loading
-        // REMOVED: No longer needed as sparse_checkout_dirs is loaded synchronously in App::new
-        // let msg = app.rx.recv().unwrap();
-        // if let AppMessage::SparseCheckoutListLoaded(result) = msg {
-        //     app.handle_sparse_checkout_list_loaded(result);
-        // } else {
-        //     panic!("Expected SparseCheckoutListLoaded message");
-        // }
 
         // Find the 'src' item and ensure it's locked
         let src_global_idx = app.items.iter().position(|i| i.path == PathBuf::from("src")).unwrap();
@@ -1094,15 +1037,6 @@ mod tests {
         // 2. Create App instance
         let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
 
-        // Process initial sparse checkout list loading
-        // REMOVED: No longer needed as sparse_checkout_dirs is loaded synchronously in App::new
-        // let msg = app.rx.recv().unwrap();
-        // if let AppMessage::SparseCheckoutListLoaded(result) = msg {
-        //     app.handle_sparse_checkout_list_loaded(result);
-        // } else {
-        //     panic!("Expected SparseCheckoutListLoaded message");
-        // }
-
         // Find the 'docs' item (a top-level directory)
         let docs_global_idx = app.items.iter().position(|i| i.path == PathBuf::from("docs")).unwrap();
         assert!(!app.items[docs_global_idx].is_checked_out, "'docs' should not be checked out initially by git");
@@ -1126,10 +1060,7 @@ mod tests {
             AppMessage::ChildrenLoaded(_) => {
                 panic!("Expected ApplyChangesCompleted message");
             }
-            AppMessage::SparseCheckoutListLoaded(result) => {
-                // Now SparseCheckoutListLoaded is sent by app.refresh(), so handle it.
-                app.handle_sparse_checkout_list_loaded(result);
-            }
+
         }
 
         // 6. Verify that git sparse-checkout list includes 'docs'
@@ -1169,15 +1100,6 @@ mod tests {
         // 2. Create App
         let app = App::new(Some(&repo_path)).expect("App initialization failed");
         
-        // Process initial sparse checkout list loading
-        // REMOVED: No longer needed as sparse_checkout_dirs is loaded synchronously in App::new
-        // let msg = app.rx.recv().unwrap();
-        // if let AppMessage::SparseCheckoutListLoaded(result) = msg {
-        //     app.handle_sparse_checkout_list_loaded(result);
-        // } else {
-        //     panic!("Expected SparseCheckoutListLoaded message");
-        // }
-
         // 3. Get View Models
         let view_models = app.get_tui_tree_items();
 
@@ -1308,11 +1230,11 @@ mod tests {
         let app = App::new(Some(&repo_path)).expect("App initialization failed"); // Changed mut to non-mut
 
         // --- Critical part: Assert the state *before* async message is processed ---
-        // At this point, app.load_initial_tree() has run, but app.handle_sparse_checkout_list_loaded has NOT.
+        // At this point, app.load_initial_tree() has run.
         // So, app.sparse_checkout_dirs is still empty, and is_checked_out should be false for the folder.
         let bug_folder_global_idx = app.items.iter().position(|i| i.path == bug_folder_path).expect("Bug folder not found in app items");
         
-        println!("DEBUG (Bug Repro Test): After App::new() and load_initial_tree(), BEFORE async message processing:");
+        println!("DEBUG (Bug Repro Test): After App::new() and load_initial_tree():");
         println!("DEBUG (Bug Repro Test): app.sparse_checkout_dirs: {:?}", app.sparse_checkout_dirs); // Should be empty
         println!("DEBUG (Bug Repro Test): app.items[{:?}].path: {:?}", bug_folder_global_idx, app.items[bug_folder_global_idx].path);
         println!("DEBUG (Bug Repro Test): app.items[{:?}].is_checked_out: {:?}", bug_folder_global_idx, app.items[bug_folder_global_idx].is_checked_out);
@@ -1322,7 +1244,6 @@ mod tests {
         assert!(app.items[bug_folder_global_idx].is_checked_out, "BUG REPRODUCED: Japanese folder should be checked out, but internal state is FALSE after initial load.");
 
         // Clean up: Process messages to avoid test interference in other tests, though not strictly needed for this bug repro.
-        // Removed: let _ = app.rx.recv().unwrap(); // SparseCheckoutListLoaded
         // Process any other potential messages if they exist to clear the channel, for other tests.
         while let Ok(_) = app.rx.try_recv() {}
     }

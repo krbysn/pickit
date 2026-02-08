@@ -75,6 +75,7 @@
 - `Shift + Tab`: 前のフォーカス可能なUI要素にフォーカスを移動します。
 - `Space` キー: `🔒` 状態でないディレクトリのチェックアウト/除外を選択/解除します。
 - `a` (Apply) キー: 選択した変更 (`+` と `-`) を `git sparse-checkout set` コマンドで実行します。
+- `r` (Refresh) キー: 現在表示されているツリーの状態を最新の情報に更新します。
 - `q` (Quit) キー: アプリケーションを終了します。
 
 ## 3. 画面レイアウト案
@@ -94,7 +95,7 @@
 |                                | Pending Changes: 1                     |
 |                                |                                        |
 +--------------------------------+----------------------------------------+
- [q] Quit [Space] Toggle [a] Apply [↑/↓] Navigate [→/←] Expand/Collapse
+ [q] Quit [Space] Toggle [a] Apply [r] Refresh [↑/↓] Navigate [→/←] Expand/Collapse
 ```
 *(上記の例では、`src` ディレクトリがツリービューで選択されている状態を示しています)*
 
