@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::ffi::OsString;
-use std::os::unix::ffi::OsStringExt; // Add this import
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -18,9 +16,27 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+// Helper function to prepend git config core.quotepath=true
+fn git_args_with_quotepath<'a>(args: &'a [&'a str]) -> Vec<&'a str> {
+    let mut new_args = Vec::new();
+    new_args.push("-c");
+    new_args.push("core.quotepath=true");
+    new_args.extend_from_slice(args);
+    new_args
+}
+
 fn run_git_command(args: &[&str], current_dir: Option<&Path>) -> Result<std::process::Output> {
     let mut command = Command::new("git");
-    command.args(args);
+
+    // Only add core.quotepath=true for commands that benefit from it and where we parse output as quoted lines.
+    // `rev-parse` outputs absolute system paths, which shouldn't be quoted for our purposes.
+    let full_args = if args.first() == Some(&"rev-parse") {
+        args.to_vec()
+    } else {
+        git_args_with_quotepath(args)
+    };
+    command.args(&full_args);
+
     if let Some(dir) = current_dir {
         command.current_dir(dir);
     }
@@ -32,7 +48,6 @@ fn run_git_command(args: &[&str], current_dir: Option<&Path>) -> Result<std::pro
     
     if !output.status.success() {
         return Err(Error::GitCommand(
-            // Always use lossy conversion for error messages as they might not be critical data
             String::from_utf8_lossy(&output.stderr).to_string(),
         ));
     }
@@ -121,98 +136,88 @@ pub fn find_repo_root() -> Result<PathBuf> {
     Ok(PathBuf::from(s.trim()))
 }
 
+// Helper to process newline-separated output into a Vec<String> of quoted paths
+fn parse_quoted_path_lines(output: std::process::Output) -> Result<Vec<String>> {
+    let s = String::from_utf8_lossy(&output.stdout).to_string(); // Use lossy for initial String conversion
+    Ok(s.lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.to_string())
+        .collect())
+}
+
 pub fn get_sparse_checkout_list(repo_path: &Path) -> Result<Vec<String>> {
     let output_result = run_git_command(&["sparse-checkout", "list"], Some(repo_path));
     match output_result {
         Ok(output) => {
-            let s = String::from_utf8(output.stdout).map_err(Error::OutputDecode)?;
-            Ok(s.lines()
-                .filter(|s| !s.is_empty())
-                .map(unescape_git_path_string) // Apply unescaping here
-                .collect())
+            let unquoted_paths = parse_quoted_path_lines(output)?;
+            // Manually quote the paths to store them in the internal quoted format
+            Ok(unquoted_paths.into_iter().map(|p| quote_path_string(&p)).collect())
         }
         Err(Error::GitCommand(stderr)) => {
             if stderr.contains("fatal: this worktree is not sparse") {
-                // If sparse-checkout is not initialized, return an empty list
                 Ok(Vec::new())
             } else {
-                // Otherwise, propagate the error
                 Err(Error::GitCommand(stderr))
             }
         }
-        Err(e) => Err(e), // Propagate other types of errors
+        Err(e) => Err(e),
     }
 }
 
-pub fn get_dirs_at_path(path: &str, repo_path: &Path) -> Result<Vec<PathBuf>> {
+pub fn get_dirs_at_path(path: &str, repo_path: &Path) -> Result<Vec<String>> {
+    let mut args = vec!["ls-tree", "-r", "--name-only", "-d"];
     let tree_ish = if path.is_empty() || path == "." {
         "HEAD".to_string()
     } else {
         format!("HEAD:{}", path)
     };
+    args.push(&tree_ish);
 
-    let output = run_git_command(&["ls-tree", "-z", "--name-only", "-d", &tree_ish], Some(repo_path))?;
+    let output = run_git_command(&args, Some(repo_path))?;
+    let mut paths = parse_quoted_path_lines(output)?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("fatal: Path") && stderr.contains("does not exist") {
-            return Ok(Vec::new());
-        } else {
-            return Err(Error::GitCommand(stderr.to_string()));
-        }
-    }
+    // Filter to only include direct children, and ensure they are relative to the current path
+    // git ls-tree -r always gives paths relative to repo root.
+    // We need to filter for direct children of 'path'
+    let prefix = if path.is_empty() || path == "." {
+        "".to_string()
+    } else {
+        format!("{}/", path)
+    };
 
-    let paths = output.stdout
-        .split(|&b| b == 0)
-        .filter(|&s| !s.is_empty())
-        .map(|s| PathBuf::from(OsString::from_vec(s.to_vec())))
-        .map(|pb| {
-            if path.is_empty() || path == "." {
-                pb
-            } else {
-                let mut full_path = PathBuf::from(path);
-                full_path.push(pb);
-                full_path
-            }
-        })
-        .collect();
+    paths.retain(|p| {
+        p.starts_with(&prefix) &&
+        p.len() > prefix.len() && // Ensure it's not the prefix itself
+        p[prefix.len()..].find('/').is_none() // Ensure no further slashes
+    });
+
+    // Remove the prefix from the paths, so they are just the direct directory names (quoted)
+    paths.iter_mut().for_each(|p| {
+        *p = p[prefix.len()..].to_string();
+    });
+
     Ok(paths)
 }
 
-pub fn get_all_directories_recursive(repo_path: &Path) -> Result<Vec<PathBuf>> {
-    let output = run_git_command(&["ls-tree", "-r", "-z", "--name-only", "-d", "HEAD"], Some(repo_path))?;
-    let paths = output.stdout
-        .split(|&b| b == 0)
-        .filter(|&s| !s.is_empty())
-        .map(|s| PathBuf::from(OsString::from_vec(s.to_vec())))
-        .collect();
-    Ok(paths)
+pub fn get_all_directories_recursive(repo_path: &Path) -> Result<Vec<String>> {
+    let output = run_git_command(&["ls-tree", "-r", "--name-only", "-d", "HEAD"], Some(repo_path))?;
+    parse_quoted_path_lines(output) // Returns Vec<String> of quoted paths
 }
 
 use std::collections::HashSet;
 
-pub fn get_uncommitted_paths(repo_path: &Path) -> Result<HashSet<PathBuf>> {
+pub fn get_uncommitted_paths(repo_path: &Path) -> Result<HashSet<String>> {
     let mut uncommitted_paths = HashSet::new();
 
-    // Get modified and staged files using git diff --name-only -z HEAD
-    let modified_output = run_git_command(&["diff", "--name-only", "-z", "HEAD"], Some(repo_path))?;
-    modified_output.stdout
-        .split(|&b| b == 0)
-        .filter(|&s| !s.is_empty())
-        .map(|s| PathBuf::from(OsString::from_vec(s.to_vec())))
-        .for_each(|p| {
-            uncommitted_paths.insert(p);
-        });
+    // Get modified and staged files using git diff --name-only HEAD
+    let output = run_git_command(&["diff", "--name-only", "HEAD"], Some(repo_path))?;
+    let modified_paths = parse_quoted_path_lines(output)?;
+    uncommitted_paths.extend(modified_paths.into_iter());
 
-    // Get untracked files using git ls-files -z --others --exclude-standard
-    let untracked_output = run_git_command(&["ls-files", "-z", "--others", "--exclude-standard"], Some(repo_path))?;
-    untracked_output.stdout
-        .split(|&b| b == 0)
-        .filter(|&s| !s.is_empty())
-        .map(|s| PathBuf::from(OsString::from_vec(s.to_vec())))
-        .for_each(|p| {
-            uncommitted_paths.insert(p);
-        });
+    // Get untracked files using git ls-files --others --exclude-standard
+    let output = run_git_command(&["ls-files", "--others", "--exclude-standard"], Some(repo_path))?;
+    let untracked_paths = parse_quoted_path_lines(output)?;
+    uncommitted_paths.extend(untracked_paths.into_iter());
 
     Ok(uncommitted_paths)
 }
@@ -222,7 +227,9 @@ pub fn set_sparse_checkout_dirs(dirs: Vec<String>, repo_path: &Path) -> Result<(
     let dirs_as_strs: Vec<&str> = dirs.iter().map(|s| s.as_str()).collect();
     args.extend(dirs_as_strs);
 
-    run_git_command(&args, Some(repo_path))?; // We just care about status, not stdout
+    // Pass `dirs` directly (these are already quoted strings from internal representation).
+    // Git is expected to unquote them as needed when processing the command.
+    run_git_command(&args, Some(repo_path))?;
     Ok(())
 }
 

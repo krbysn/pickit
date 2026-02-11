@@ -138,3 +138,71 @@
     *   `pickit` がこのテストリポジリのツリーを正しく読み込み、表示できること。
     *   日本語ファイル名を持つノードを正しく選択し、`git sparse-checkout set` コマンドがエラーなく実行されること。
     *   変更適用後、日本語ファイルが期待通りにチェックアウトまたはアンチェックアウトされることを検証する。
+# 新しいパス処理戦略
+
+## 方針
+
+`pickit` は Git の疎結合チェックアウトを管理するツールであるため、パス処理においては Git のセマンティクスを最優先する。OS ネイティブのパス表現 `PathBuf` は、アプリケーション起動時のリポジトリルート指定および `std::env::set_current_dir` の呼び出しに限定し、それ以外のリポジトリ内部パスの表現には Git の出力形式に合わせた `String` を用いる。これにより `std::os::unix::ffi::OsStringExt` の利用を排除し、Windows を含むクロスプラットフォームでの堅牢な動作を目指す。
+
+## 詳細
+
+1.  **リポジトリ内部パスの内部表現:**
+    *   `TreeItem.path`, `App` 構造体内の `sparse_checkout_dirs`, `uncommitted_paths` など、リポジトリ内のファイルやディレクトリを示すパスは、**クオートされた Git の文字列表現**を `String` 型で保持する。
+    *   これは `git` コマンドが `core.quotepath=true` 設定で出力する形式（例: `foo\ bar/baz`, `"\343\201\202.txt"`）に準拠する。
+
+2.  **Git コマンドの実行とパスの取得:**
+    *   `src/git.rs` 内で `git` コマンドを実行する際、`std::process::Command` に `"-c", "core.quotepath=true"` を追加する。
+    *   現在の `git ls-tree -z`, `git diff -z`, `git ls-files -z` の呼び出しを、対応する**非 `--zero` オプションのコマンド**に変更する。これらはパスを改行区切りで出力し、必要に応じてクオートされる。
+        *   例: `git ls-tree -z --name-only -d HEAD` → `git ls-tree -r --name-only -d HEAD` (ただし、これだけでは `core.quotepath` が適用されない可能性や、ディレクトリとファイルが混じる問題があるため、適切なコマンド選定が必要)
+        *   例: `git diff --name-only -z HEAD` → `git diff --name-only HEAD`
+        *   例: `git ls-files -z --others --exclude-standard` → `git ls-files --others --exclude-standard`
+    *   `git` コマンドの標準出力 (`stdout`) は `Vec<u8>` として受け取る。これを `String::from_utf8_lossy()` で `String` に変換する。この `String` は、改行区切りでクオートされたパスを含む。
+    *   この `String` を改行で分割し、各行を内部のパス表現 (`String`) として格納する。
+
+3.  **リポジトリ内部パスの操作（join, parent, file_name, starts_with など）:**
+    *   これらの操作は、内部の**クオートされた `String`** に対して直接行う。
+    *   Git の `core.quotepath=true` 出力の仕様上、パス区切り文字の `/` はエスケープされず、表示可能な ASCII 文字として残るため、この `/` を基点とした `String` 操作が可能。
+    *   例: `String::rfind('/')` で最後の区切り文字を見つけ、`String::slice` で親パスやファイル名を抽出。
+    *   このロジックは `pickit` 内にカスタムで実装する。
+
+4.  **表示（TUI）:**
+    *   内部に保持するクオートされた `String` パスを、`git.rs` に存在する `unescape_git_path_string` 関数に通して、人間が読める通常の `String` に変換してから TUI に表示する。これにより、日本語ファイル名なども正しく表示される。
+
+5.  **Git コマンドへの入力（引数として）:**
+    *   `git sparse-checkout set` など、内部のパスを `git` コマンドの引数として渡す必要がある場合、内部のクオートされた `String` パスを**そのまま** `std::process::Command::arg()` メソッドに渡す。Git のパーサーがクオートされた文字列を正しく解釈することを期待する。
+
+6.  **`PathBuf` の利用:**
+    *   `current_repo_root: PathBuf` は `App` 構造体で `PathBuf` 型として保持する。これは `std::env::set_current_dir` や `std::process::Command::current_dir` に必要であるため。
+
+## PR への影響
+
+この新しいパス処理戦略は、既存のPR計画に以下の変更をもたらす。
+
+*   **PR #1:** `git` モジュール内の Git コマンド呼び出しとその出力処理が大きく変更される。特に `core.quotepath=true` の適用と、`--zero` オプションを使用しないコマンドへの変更が含まれる。`std::os::unix::ffi::OsStringExt` の利用は排除される。
+*   **PR #2, #3, #4, #5, #6:** `TreeItem.path` などのパス関連フィールドの型が `PathBuf` から `String` に変更される。パス操作ロジックは `PathBuf` メソッドではなく、カスタムの `String` 操作メソッドに置き換えられる。`App` 内でのパス比較などにも影響する。
+*   **PR #10 (日本語ファイル名対応):** このPRで提案されていたロケール設定の強化や UTF-8 デコードの確実化は、新しい戦略（`core.quotepath=true` によるクオート形式の利用と `String::from_utf8_lossy` での変換）によって置き換えられる。パス処理の主要な変更はこの戦略の一部となる。
+
+## 機能追加計画 (再編成)
+
+自動ファイル監視の削除 (旧 PR #8) と変更適用時のプログレスダイアログ表示 (旧 PR #9) は、この戦略の変更とは独立して進められるため、既存の計画を引き継ぐ。
+
+### PR #8: 手動リフレッシュ機能の実装
+(旧 PR #8 から名称変更・内容整理)
+
+**目的:** アプリケーションの状態を手動で更新する機能を提供し、パフォーマンスを向上させる。
+
+**タスク:**
+1.  既存の自動ファイル監視に関連するコード（もしあれば）をすべて削除する。
+2.  `App` 層に、アプリケーションの状態を再読み込みし、TUIを再描画するための `refresh` メソッドを実装する。このメソッドは、`git sparse-checkout list` や `git ls-tree` などのコマンドを再実行し、ツリー構造と各ディレクトリの状態を最新の情報に更新する。
+3.  TUIのイベントループに `r` キーのハンドリングを追加する。`r` キーが押されたら、`App` の `refresh` メソッドを呼び出し、UIを更新する。
+
+### PR #9: 変更適用時のプログレスダイアログ表示
+(旧 PR #9 から名称変更・内容整理)
+
+**目的:** 変更適用時にユーザーに進捗状況を視覚的に伝え、ユーザーエクスペリエンスを向上させる。
+
+**タスク:**
+1.  `App` 構造体に、変更適用中であることを示す`is_applying_changes: bool`フラグを追加。
+2.  `App::apply_changes` メソッド内で、処理開始時に `is_applying_changes` を `true` に設定し、処理完了後（成功・失敗問わず）に `false` に戻す。
+3.  `run_app` 関数（TUIレンダリングループ）内で、`app.is_applying_changes` が `true` の場合、メインUIの代わりに「変更を適用中...お待ちください。」というメッセージを表示するシンプルなプログレスダイアログをレンダリングする。
+4.  `is_applying_changes` フラグのライフサイクルを検証するユニットテストを追加。

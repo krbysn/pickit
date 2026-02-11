@@ -2,18 +2,20 @@ use crate::git;
 use itertools::Itertools;
 use ratatui::style::{Color, Style};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf; // Removed Path
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
+
+use crate::git::{unescape_git_path_string, quote_path_string}; // Import for display and path manipulation
 
 // Define messages that can be sent from background threads to the main thread
 pub enum AppMessage {
     ApplyChangesCompleted(Result<(), git::Error>),
-    ChildrenLoaded(Result<(usize, Vec<PathBuf>), git::Error>),
-        RefreshCompleted(Result<(Vec<PathBuf>, HashSet<PathBuf>), git::Error>),
-    }
+    ChildrenLoaded(Result<(usize, Vec<String>), git::Error>), // Changed Vec<PathBuf> to Vec<String>
+    RefreshCompleted(Result<(Vec<String>, HashSet<String>), git::Error>), // Changed Vec<PathBuf>, HashSet<PathBuf> to Vec<String>, HashSet<String>
+}
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)] // Added Hash
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
 pub enum ChangeType {
     Add,
     Remove,
@@ -29,7 +31,7 @@ pub struct TuiTreeItemViewModel {
 #[derive(Debug, Clone, Default)]
 pub struct GridViewModel {
     pub name: String,
-    pub path: String, // Keep as String for display purposes
+    pub path: String, // Keep as String for display purposes (unescaped)
     pub status: String,
     pub uncommitted: String,
     pub subdirectories_total: String,
@@ -37,10 +39,10 @@ pub struct GridViewModel {
     pub pending_changes: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)] // Add Hash for PathBuf in HashSet
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TreeItem {
-    pub path: PathBuf, // Changed from String
-    pub name: String,
+    pub path: String, // Changed from PathBuf to String (quoted path)
+    pub name: String, // Unquoted name for display
     pub children_indices: Vec<usize>, // Indices of direct children in the App's items vec
     pub parent_index: Option<usize>,
     pub is_expanded: bool,
@@ -57,7 +59,7 @@ pub struct TreeItem {
 }
 
 impl TreeItem {
-    pub fn new(path: PathBuf, name: String, is_checked_out: bool) -> Self { // Changed path to PathBuf
+    pub fn new(path: String, name: String, is_checked_out: bool) -> Self { // Changed path to String
         TreeItem {
             path,
             name,
@@ -70,8 +72,8 @@ impl TreeItem {
             is_locked: false,
             contains_uncommitted_changes: false,
             has_checked_out_descendant: false,
-            is_implicitly_checked_out: false, // Initialize new field
-            is_loading: false,                // Initialize new field
+            is_implicitly_checked_out: false,
+            is_loading: false,
             indentation_level: 0,
             cached_pending_changes: 0,
         }
@@ -81,9 +83,9 @@ impl TreeItem {
 #[derive(Debug)]
 pub struct App {
     #[allow(dead_code)] // Will be used in UI and other places
-    pub current_repo_root: PathBuf,
+    pub current_repo_root: PathBuf, // Remains PathBuf
     pub items: Vec<TreeItem>, // Flat list of all directories
-    pub path_to_index: HashMap<PathBuf, usize>, // Changed key from String to PathBuf
+    pub path_to_index: HashMap<String, usize>, // Changed key from PathBuf to String
     pub filtered_item_indices: Vec<usize>, // Indices of items currently visible in the TUI
     pub selected_item_index: usize, // Index into `filtered_item_indices`
     #[allow(dead_code)] // Will be used for TUI scrolling
@@ -97,9 +99,8 @@ pub struct App {
     pub rx: mpsc::Receiver<AppMessage>, // Receiver for App to get messages from background tasks
 
     // Cached git state
-    pub sparse_checkout_dirs: Vec<PathBuf>, // Changed from Vec<String>
-    pub uncommitted_paths: HashSet<PathBuf>,
-
+    pub sparse_checkout_dirs: Vec<String>, // Changed from Vec<PathBuf> to Vec<String>
+    pub uncommitted_paths: HashSet<String>, // Changed from HashSet<PathBuf> to HashSet<String>
 }
 
 impl Default for App {
@@ -119,12 +120,42 @@ impl Default for App {
             rx: mpsc::channel().1,      // Initialize receiver (dummy, will be replaced in App::new)
             sparse_checkout_dirs: Vec::new(),
             uncommitted_paths: HashSet::new(),
-
         }
     }
 }
 
 impl App {
+    // Helper to extract the parent path from a quoted string path
+    // e.g., "foo\\ bar/baz" -> "foo\\ bar"
+    //       "foo" -> ""
+    fn path_parent(path: &str) -> Option<String> {
+        path.rfind('/').map(|i| path[..i].to_string())
+    }
+
+    // Helper to extract the file/directory name from a quoted string path
+    // e.g., "foo\\ bar/baz" -> "baz"
+    //       "foo" -> "foo"
+    fn path_file_name(path: &str) -> Option<String> {
+        path.rfind('/').map(|i| path[i + 1..].to_string())
+    }
+
+    // Helper to join two quoted string paths
+    // This assumes `other` is a simple component or relative path
+    fn path_join(base: &str, other: &str) -> String {
+        if base.is_empty() {
+            other.to_string()
+        } else {
+            format!("{}/{}", base, other)
+        }
+    }
+
+    // Helper to check if a quoted string path starts with another quoted string path as a component
+    // e.g., "foo/bar" starts with "foo" -> true
+    //       "foo/bar" starts with "foobar" -> false
+    fn path_starts_with_component(path: &str, prefix: &str) -> bool {
+        path.starts_with(prefix) && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
+    }
+
     // New helper function to recursively update cached_pending_changes
     fn update_pending_changes_cache(&mut self, item_idx: usize) {
         let mut current_pending_changes = 0;
@@ -153,7 +184,7 @@ impl App {
         }
     }
 
-    pub fn handle_refresh_completed(&mut self, result: Result<(Vec<PathBuf>, HashSet<PathBuf>), git::Error>) {
+    pub fn handle_refresh_completed(&mut self, result: Result<(Vec<String>, HashSet<String>), git::Error>) {
         self.is_refreshing = false; // Refresh is complete
         match result {
             Ok((sparse_checkout_dirs, uncommitted_paths)) => {
@@ -170,7 +201,7 @@ impl App {
 
     pub fn handle_children_loaded(
         &mut self,
-        result: Result<(usize, Vec<PathBuf>), git::Error>, // Changed Vec<String> to Vec<PathBuf>
+        result: Result<(usize, Vec<String>), git::Error>, // Changed Vec<PathBuf> to Vec<String>
     ) {
         match result {
             Ok((parent_idx, sub_dirs)) => {
@@ -179,26 +210,22 @@ impl App {
                 parent_item.children_loaded = true;
 
                 if !sub_dirs.is_empty() {
-                    for dir_path in sub_dirs.into_iter().sorted() { // dir_path is now PathBuf
+                    for dir_path in sub_dirs.into_iter().sorted() { // dir_path is now String (quoted path)
                         if self.path_to_index.contains_key(&dir_path) {
                             continue;
                         }
 
-                        // dir_path is already PathBuf
-                        let name = dir_path
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .to_string();
-                        let is_checked_out = self.sparse_checkout_dirs.contains(&dir_path); // Compare PathBuf with PathBuf
+                        // dir_path is already String (quoted path)
+                        let name = unescape_git_path_string(&dir_path); // Unescape for display name
+                        let is_checked_out = self.sparse_checkout_dirs.contains(&dir_path); // Compare String with String
 
                         let contains_uncommitted_changes = self
                             .uncommitted_paths
                             .iter()
-                            .any(|p| p.starts_with(&dir_path)); // Compare PathBuf with PathBuf
+                            .any(|p| self.path_starts_with_component(p, &dir_path)); // Use custom helper
                         let is_locked = contains_uncommitted_changes;
 
-                        let mut item = TreeItem::new(dir_path.clone(), name, is_checked_out); // Pass PathBuf
+                        let mut item = TreeItem::new(dir_path.clone(), name, is_checked_out); // Pass String for path
                         item.contains_uncommitted_changes = contains_uncommitted_changes;
                         item.is_locked = is_locked;
                         item.parent_index = Some(parent_idx);
@@ -207,7 +234,7 @@ impl App {
                         
                         let new_idx = self.items.len();
                         self.items[parent_idx].children_indices.push(new_idx);
-                        self.path_to_index.insert(dir_path, new_idx); // Insert PathBuf
+                        self.path_to_index.insert(dir_path, new_idx); // Insert String
                         self.items.push(item);
                     }
                 }
@@ -234,22 +261,20 @@ impl App {
         // Pass 1: Determine `has_checked_out_descendant` by checking `sparse_checkout_dirs`.
         // This is done once all items are loaded and `sparse_checkout_dirs` is up-to-date.
         for i in 0..self.items.len() {
-            let item_path = &self.items[i].path; // item_path is now &PathBuf
+            let item_path = &self.items[i].path; // item_path is now &String (quoted path)
             let has_descendant = self
                 .sparse_checkout_dirs
                 .iter()
-                .any(|sco_path| { // sco_path is now &PathBuf
-                    if item_path == &PathBuf::from(".") { // Compare PathBuf with PathBuf
+                .any(|sco_path| { // sco_path is now &String (quoted path)
+                    if item_path == "." { // Compare String with "." (root path)
                         // For the root item, any sparse checkout path that is not "." itself
                         // indicates a checked out descendant.
-                        sco_path != &PathBuf::from(".")
+                        sco_path != "."
                     } else {
                         // For other items, check for true descendant paths.
-                        // `sco_path` must start with `item_path`.
-                        // `sco_path` must be longer than `item_path`.
-                        // Use PathBuf methods for component-wise comparison
-                        sco_path.starts_with(item_path) &&
-                        sco_path.components().count() > item_path.components().count()
+                        // `sco_path` must start with `item_path` as a component.
+                        self.path_starts_with_component(sco_path, item_path) &&
+                        sco_path.len() > item_path.len() // Ensure it's longer
                     }
                 });
             self.items[i].has_checked_out_descendant = has_descendant;
@@ -276,7 +301,7 @@ impl App {
             let parent_is_effectively_checked_out =
                 if let Some(parent_idx) = self.items[i].parent_index {
                     // Do not consider the root directory for implicit checkout logic
-                    if parent_idx == 0 {
+                    if parent_idx == 0 { // Root item has index 0
                         false
                     } else {
                         let parent = &self.items[parent_idx];
@@ -303,38 +328,41 @@ impl App {
         self.path_to_index.clear();
 
         // 1. Create Root Item
+        // For the root, the path is represented as "." internally.
+        let root_quoted_path = ".".to_string();
         let root_name = self
             .current_repo_root
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let mut root_item = TreeItem::new(PathBuf::from("."), root_name, true); // Pass PathBuf
+        let mut root_item = TreeItem::new(root_quoted_path.clone(), root_name, true); // Pass String
         root_item.is_locked = true;
         root_item.is_expanded = true;
         root_item.children_loaded = true;
         root_item.indentation_level = 0; // Root is at level 0
         root_item.cached_pending_changes = 0;
         self.items.push(root_item);
-        self.path_to_index.insert(PathBuf::from("."), 0); // Insert PathBuf
+        self.path_to_index.insert(root_quoted_path, 0); // Insert String
 
         // 2. Load Top-Level Dirs
-        let top_level_dirs = git::get_dirs_at_path(".", &self.current_repo_root)?; // Returns Vec<PathBuf>
-        for dir_path in top_level_dirs.into_iter().sorted() { // dir_path is now PathBuf
-            let name = dir_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let is_checked_out = self.sparse_checkout_dirs.contains(&dir_path); // Compare PathBuf with PathBuf
+        let top_level_dirs = git::get_dirs_at_path(".", &self.current_repo_root)?; // Returns Vec<String> (quoted paths)
+        for dir_path in top_level_dirs.into_iter().sorted() { // dir_path is now String (quoted path)
+            if self.path_to_index.contains_key(&dir_path) {
+                continue;
+            }
+
+            // dir_path is already String (quoted path)
+            let name = unescape_git_path_string(&dir_path); // Unescape for display name
+            let is_checked_out = self.sparse_checkout_dirs.contains(&dir_path); // Compare String with String
 
             let contains_uncommitted_changes = self
                 .uncommitted_paths
                 .iter()
-                .any(|p| p.starts_with(&dir_path)); // Compare PathBuf with PathBuf
+                .any(|p| self.path_starts_with_component(p, &dir_path)); // Use custom helper
             let is_locked = contains_uncommitted_changes;
 
-            let mut item = TreeItem::new(dir_path.clone(), name, is_checked_out); // Pass PathBuf
+            let mut item = TreeItem::new(dir_path.clone(), name, is_checked_out); // Pass String
             item.contains_uncommitted_changes = contains_uncommitted_changes;
             item.is_locked = is_locked;
             item.parent_index = Some(0);
@@ -343,7 +371,7 @@ impl App {
             
             let new_idx = self.items.len();
             self.items[0].children_indices.push(new_idx);
-            self.path_to_index.insert(dir_path, new_idx); // Insert PathBuf
+            self.path_to_index.insert(dir_path, new_idx); // Insert String
             self.items.push(item);
         }
         self.update_tree_item_states();
@@ -365,21 +393,19 @@ impl App {
         let repo_root = self.current_repo_root.clone();
         let tx_clone = self.tx.clone();
 
-        // --- Bug Fix #4: Ensure all pending changes are applied correctly based on actual git state ---
-        let current_actual_sparse_list_str = match git::get_sparse_checkout_list(&repo_root) {
+        let current_actual_sparse_list = match git::get_sparse_checkout_list(&repo_root) {
             Ok(list) => list,
             Err(e) => {
-                // If we can't get the current sparse list, send an error back to main thread
                 let _ = tx_clone.send(AppMessage::ApplyChangesCompleted(Err(e)));
-                return; // Exit early
+                return;
             }
         };
-        // Convert Vec<String> to HashSet<PathBuf>
-        let mut final_sparse_checkout_set: HashSet<PathBuf> = current_actual_sparse_list_str.into_iter().map(PathBuf::from).collect();
+        // Convert Vec<String> (quoted paths) to HashSet<String>
+        let mut final_sparse_checkout_set: HashSet<String> = current_actual_sparse_list.into_iter().collect();
 
         // Apply pending changes from self.items on top of the actual git state
         for item in self.items.iter() {
-            if item.path == PathBuf::from(".") { continue; } // Root is always implicitly checked out and cannot be changed
+            if item.path == "." { continue; } // Root is always implicitly checked out and cannot be changed
 
             match item.pending_change {
                 Some(ChangeType::Add) => {
@@ -392,11 +418,8 @@ impl App {
             }
         }
         
-        // Convert the final set to a Vec<String> for the git command
-        let dirs_to_checkout: Vec<String> = final_sparse_checkout_set.into_iter().map(|p| p.to_string_lossy().to_string()).collect();
-
-        // Capture necessary variables for the thread (repo_root, dirs_to_checkout, tx_clone)
-        // Note: repo_root and dirs_to_checkout are cloned for the thread's ownership.
+        // Convert the final set to a Vec<String> for the git command (already quoted paths)
+        let dirs_to_checkout: Vec<String> = final_sparse_checkout_set.into_iter().collect();
 
         // Spawn a new thread to perform the potentially long-running git operation
         thread::spawn(move || {
@@ -416,9 +439,8 @@ impl App {
         let tx_clone = self.tx.clone();
 
         thread::spawn(move || {
-            let result: Result<(Vec<PathBuf>, HashSet<PathBuf>), git::Error> = (|| {
-                let current_sparse_checkout_list_str = git::get_sparse_checkout_list(&repo_root_clone)?;
-                let sparse_checkout_dirs: Vec<PathBuf> = current_sparse_checkout_list_str.into_iter().map(PathBuf::from).collect();
+            let result: Result<(Vec<String>, HashSet<String>), git::Error> = (|| {
+                let sparse_checkout_dirs = git::get_sparse_checkout_list(&repo_root_clone)?;
                 let uncommitted_paths = git::get_uncommitted_paths(&repo_root_clone)?;
                 Ok((sparse_checkout_dirs, uncommitted_paths))
             })();
@@ -428,7 +450,7 @@ impl App {
     }
 
     // Helper function to update app state based on fetched git info
-    fn update_state_from_git_info(&mut self, new_sparse_checkout_dirs: Vec<PathBuf>, new_uncommitted_paths: HashSet<PathBuf>) {
+    fn update_state_from_git_info(&mut self, new_sparse_checkout_dirs: Vec<String>, new_uncommitted_paths: HashSet<String>) {
         self.sparse_checkout_dirs = new_sparse_checkout_dirs;
         self.uncommitted_paths = new_uncommitted_paths;
 
@@ -437,7 +459,7 @@ impl App {
             let item = &mut self.items[i];
 
             // Root item is special
-            if item.path == PathBuf::from(".") {
+            if item.path == "." { // Compare String with "."
                 item.is_checked_out = true;
                 item.is_locked = true; // Root is always locked
                 continue;
@@ -450,7 +472,7 @@ impl App {
             let contains_uncommitted_changes = self
                 .uncommitted_paths
                 .iter()
-                .any(|p| p.starts_with(&item.path));
+                .any(|p| self.path_starts_with_component(p, &item.path)); // Use custom helper
             item.contains_uncommitted_changes = contains_uncommitted_changes;
             item.is_locked = contains_uncommitted_changes;
         }
@@ -506,7 +528,7 @@ impl App {
 
                 GridViewModel {
                     name: item.name.clone(),
-                    path: item.path.to_string_lossy().to_string(), // Convert PathBuf to String for display
+                    path: unescape_git_path_string(&item.path), // Unescape for display
                     status,
                     uncommitted,
                     subdirectories_total: item.children_indices.len().to_string(),
@@ -601,8 +623,7 @@ impl App {
         let (tx, rx) = mpsc::channel(); // Create the channel
         
         // Synchronously load sparse checkout list at startup
-        let initial_sparse_checkout_list_str = git::get_sparse_checkout_list(&current_repo_root)?;
-        let initial_sparse_checkout_dirs = initial_sparse_checkout_list_str.into_iter().map(PathBuf::from).collect();
+        let initial_sparse_checkout_dirs = git::get_sparse_checkout_list(&current_repo_root)?;
 
         let mut app = App {
             current_repo_root,
@@ -679,18 +700,13 @@ impl App {
 
         // Start loading children
         item.is_loading = true;
-        let item_path = item.path.clone();
+        let item_path = item.path.clone(); // item_path is String (quoted path)
         let repo_root = self.current_repo_root.clone();
         let tx_clone = self.tx.clone();
 
         thread::spawn(move || {
-            let path_str_result = item_path
-                .to_str()
-                .ok_or(git::Error::InvalidPath("Invalid UTF-8 path in TreeItem path".to_string()));
-            let result = match path_str_result {
-                Ok(path_str) => git::get_dirs_at_path(path_str, &repo_root).map(|dirs| (global_idx, dirs)),
-                Err(e) => Err(e),
-            };
+            // item_path is already a String (quoted path), directly pass it
+            let result = git::get_dirs_at_path(&item_path, &repo_root).map(|dirs| (global_idx, dirs));
             let _ = tx_clone.send(AppMessage::ChildrenLoaded(result));
         });
     }
