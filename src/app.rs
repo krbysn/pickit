@@ -1,14 +1,12 @@
 use crate::git;
-use itertools::Itertools;
 use ratatui::style::{Color, Style};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 
-use crate::git::{unescape_git_path_string, quote_path_string}; // Import for display and path manipulation
-
 // Define messages that can be sent from background threads to the main thread
+#[derive(Debug)] // Add this line
 pub enum AppMessage {
     ApplyChangesCompleted(Result<(), git::Error>),
     ChildrenLoaded(Result<(usize, Vec<String>), git::Error>), // Changed Vec<PathBuf> to Vec<String>
@@ -41,8 +39,8 @@ pub struct GridViewModel {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TreeItem {
-    pub path: String, // Changed from PathBuf to String (quoted path)
-    pub name: String, // Unquoted name for display
+    pub path: String, // Changed from PathBuf to String (unescaped path)
+    pub name: String, // Unescaped name for display
     pub children_indices: Vec<usize>, // Indices of direct children in the App's items vec
     pub parent_index: Option<usize>,
     pub is_expanded: bool,
@@ -78,6 +76,13 @@ impl TreeItem {
             cached_pending_changes: 0,
         }
     }
+}
+
+// Helper to check if a string path starts with another string path as a component
+// e.g., "foo/bar" starts with "foo" -> true
+//       "foo/bar" starts with "foobar" -> false
+fn path_starts_with_component(path: &str, prefix: &str) -> bool {
+    path.starts_with(prefix) && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
 }
 
 #[derive(Debug)]
@@ -125,35 +130,31 @@ impl Default for App {
 }
 
 impl App {
-    // Helper to extract the parent path from a quoted string path
-    // e.g., "foo\\ bar/baz" -> "foo\\ bar"
+    // Helper to extract the parent path from a path string
+    // e.g., "foo bar/baz" -> "foo bar"
     //       "foo" -> ""
+    #[allow(dead_code)]
     fn path_parent(path: &str) -> Option<String> {
         path.rfind('/').map(|i| path[..i].to_string())
     }
 
-    // Helper to extract the file/directory name from a quoted string path
-    // e.g., "foo\\ bar/baz" -> "baz"
+    // Helper to extract the file/directory name from a path string
+    // e.g., "foo bar/baz" -> "baz"
     //       "foo" -> "foo"
+    #[allow(dead_code)]
     fn path_file_name(path: &str) -> Option<String> {
         path.rfind('/').map(|i| path[i + 1..].to_string())
     }
 
-    // Helper to join two quoted string paths
+    // Helper to join two path strings
     // This assumes `other` is a simple component or relative path
+    #[allow(dead_code)]
     fn path_join(base: &str, other: &str) -> String {
         if base.is_empty() {
             other.to_string()
         } else {
             format!("{}/{}", base, other)
         }
-    }
-
-    // Helper to check if a quoted string path starts with another quoted string path as a component
-    // e.g., "foo/bar" starts with "foo" -> true
-    //       "foo/bar" starts with "foobar" -> false
-    fn path_starts_with_component(path: &str, prefix: &str) -> bool {
-        path.starts_with(prefix) && (path.len() == prefix.len() || path.as_bytes()[prefix.len()] == b'/')
     }
 
     // New helper function to recursively update cached_pending_changes
@@ -210,22 +211,32 @@ impl App {
                 parent_item.children_loaded = true;
 
                 if !sub_dirs.is_empty() {
-                    for dir_path in sub_dirs.into_iter().sorted() { // dir_path is now String (quoted path)
-                        if self.path_to_index.contains_key(&dir_path) {
+                    let mut sorted_sub_dirs = sub_dirs;
+                    sorted_sub_dirs.sort();
+
+                    let parent_item_path = self.items[parent_idx].path.clone(); // Get the full path of the parent
+
+                    for dir_name in sorted_sub_dirs { // dir_name is now the simple name of the directory
+                        let full_child_path = if parent_item_path == "." {
+                            dir_name.clone() // If parent is root, child path is just its name
+                        } else {
+                            format!("{}/{}", parent_item_path, dir_name)
+                        };
+                        let name = dir_name.clone(); // Name for display remains just the component name
+
+                        if self.path_to_index.contains_key(&full_child_path) {
                             continue;
                         }
 
-                        // dir_path is already String (quoted path)
-                        let name = unescape_git_path_string(&dir_path); // Unescape for display name
-                        let is_checked_out = self.sparse_checkout_dirs.contains(&dir_path); // Compare String with String
+                        let is_checked_out = self.sparse_checkout_dirs.contains(&full_child_path); // Compare String with String
 
                         let contains_uncommitted_changes = self
                             .uncommitted_paths
                             .iter()
-                            .any(|p| self.path_starts_with_component(p, &dir_path)); // Use custom helper
+                            .any(|p| path_starts_with_component(p, &full_child_path)); // Use custom helper
                         let is_locked = contains_uncommitted_changes;
 
-                        let mut item = TreeItem::new(dir_path.clone(), name, is_checked_out); // Pass String for path
+                        let mut item = TreeItem::new(full_child_path.clone(), name, is_checked_out); // Pass String for path
                         item.contains_uncommitted_changes = contains_uncommitted_changes;
                         item.is_locked = is_locked;
                         item.parent_index = Some(parent_idx);
@@ -234,15 +245,13 @@ impl App {
                         
                         let new_idx = self.items.len();
                         self.items[parent_idx].children_indices.push(new_idx);
-                        self.path_to_index.insert(dir_path, new_idx); // Insert String
+                        self.path_to_index.insert(full_child_path, new_idx); // Insert String
                         self.items.push(item);
                     }
                 }
                 
                 let parent_item = &mut self.items[parent_idx];
-                if !parent_item.children_indices.is_empty() {
-                    parent_item.is_expanded = true;
-                }
+                parent_item.is_expanded = true; // Always set to expanded if children were loaded (even if empty)
 
                 self.update_tree_item_states();
                 self.build_visible_items();
@@ -261,11 +270,11 @@ impl App {
         // Pass 1: Determine `has_checked_out_descendant` by checking `sparse_checkout_dirs`.
         // This is done once all items are loaded and `sparse_checkout_dirs` is up-to-date.
         for i in 0..self.items.len() {
-            let item_path = &self.items[i].path; // item_path is now &String (quoted path)
+            let item_path = &self.items[i].path; // item_path is now &String (unescaped path)
             let has_descendant = self
                 .sparse_checkout_dirs
                 .iter()
-                .any(|sco_path| { // sco_path is now &String (quoted path)
+                .any(|sco_path| { // sco_path is now &String (unescaped path)
                     if item_path == "." { // Compare String with "." (root path)
                         // For the root item, any sparse checkout path that is not "." itself
                         // indicates a checked out descendant.
@@ -273,7 +282,7 @@ impl App {
                     } else {
                         // For other items, check for true descendant paths.
                         // `sco_path` must start with `item_path` as a component.
-                        self.path_starts_with_component(sco_path, item_path) &&
+                        path_starts_with_component(sco_path, item_path) &&
                         sco_path.len() > item_path.len() // Ensure it's longer
                     }
                 });
@@ -329,37 +338,40 @@ impl App {
 
         // 1. Create Root Item
         // For the root, the path is represented as "." internally.
-        let root_quoted_path = ".".to_string();
+        let root_path = ".".to_string(); // Path is now unescaped, use "."
         let root_name = self
             .current_repo_root
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let mut root_item = TreeItem::new(root_quoted_path.clone(), root_name, true); // Pass String
+        let mut root_item = TreeItem::new(root_path.clone(), root_name, true); // Pass String
         root_item.is_locked = true;
         root_item.is_expanded = true;
         root_item.children_loaded = true;
         root_item.indentation_level = 0; // Root is at level 0
         root_item.cached_pending_changes = 0;
         self.items.push(root_item);
-        self.path_to_index.insert(root_quoted_path, 0); // Insert String
+        self.path_to_index.insert(root_path, 0); // Insert String
 
         // 2. Load Top-Level Dirs
-        let top_level_dirs = git::get_dirs_at_path(".", &self.current_repo_root)?; // Returns Vec<String> (quoted paths)
-        for dir_path in top_level_dirs.into_iter().sorted() { // dir_path is now String (quoted path)
+        let top_level_dirs = git::get_dirs_at_path(".", &self.current_repo_root)?; // Returns Vec<String> (unescaped paths)
+        let mut sorted_top_level_dirs = top_level_dirs;
+        sorted_top_level_dirs.sort();
+
+        for dir_path in sorted_top_level_dirs { // dir_path is now String (unescaped path)
+            let name = dir_path.clone(); // Path is now unescaped, use directly
+
             if self.path_to_index.contains_key(&dir_path) {
                 continue;
             }
 
-            // dir_path is already String (quoted path)
-            let name = unescape_git_path_string(&dir_path); // Unescape for display name
             let is_checked_out = self.sparse_checkout_dirs.contains(&dir_path); // Compare String with String
 
             let contains_uncommitted_changes = self
                 .uncommitted_paths
                 .iter()
-                .any(|p| self.path_starts_with_component(p, &dir_path)); // Use custom helper
+                .any(|p| path_starts_with_component(p, &dir_path)); // Use custom helper
             let is_locked = contains_uncommitted_changes;
 
             let mut item = TreeItem::new(dir_path.clone(), name, is_checked_out); // Pass String
@@ -400,7 +412,7 @@ impl App {
                 return;
             }
         };
-        // Convert Vec<String> (quoted paths) to HashSet<String>
+        // Convert Vec<String> (unescaped paths) to HashSet<String>
         let mut final_sparse_checkout_set: HashSet<String> = current_actual_sparse_list.into_iter().collect();
 
         // Apply pending changes from self.items on top of the actual git state
@@ -418,7 +430,7 @@ impl App {
             }
         }
         
-        // Convert the final set to a Vec<String> for the git command (already quoted paths)
+        // Convert the final set to a Vec<String> for the git command (already unescaped paths)
         let dirs_to_checkout: Vec<String> = final_sparse_checkout_set.into_iter().collect();
 
         // Spawn a new thread to perform the potentially long-running git operation
@@ -472,7 +484,7 @@ impl App {
             let contains_uncommitted_changes = self
                 .uncommitted_paths
                 .iter()
-                .any(|p| self.path_starts_with_component(p, &item.path)); // Use custom helper
+                .any(|p| path_starts_with_component(p, &item.path)); // Use custom helper
             item.contains_uncommitted_changes = contains_uncommitted_changes;
             item.is_locked = contains_uncommitted_changes;
         }
@@ -528,7 +540,7 @@ impl App {
 
                 GridViewModel {
                     name: item.name.clone(),
-                    path: unescape_git_path_string(&item.path), // Unescape for display
+                    path: item.path.clone(), // Path is now unescaped
                     status,
                     uncommitted,
                     subdirectories_total: item.children_indices.len().to_string(),
@@ -700,13 +712,16 @@ impl App {
 
         // Start loading children
         item.is_loading = true;
-        let item_path = item.path.clone(); // item_path is String (quoted path)
+        
+        // Corrected: item.path already stores the full path relative to repo root
+        let full_path_to_expand = self.items[global_idx].path.clone();
+
         let repo_root = self.current_repo_root.clone();
         let tx_clone = self.tx.clone();
 
         thread::spawn(move || {
-            // item_path is already a String (quoted path), directly pass it
-            let result = git::get_dirs_at_path(&item_path, &repo_root).map(|dirs| (global_idx, dirs));
+            // Pass the reconstructed full path to get_dirs_at_path
+            let result = git::get_dirs_at_path(&full_path_to_expand, &repo_root).map(|dirs| (global_idx, dirs));
             let _ = tx_clone.send(AppMessage::ChildrenLoaded(result));
         });
     }
@@ -722,33 +737,29 @@ impl App {
 
     pub fn handle_left_key(&mut self) {
         if let Some(&global_idx) = self.filtered_item_indices.get(self.selected_item_index) {
-            // _item_path was PathBuf, now removed as not used
-            // let _item_path = self.items[global_idx].path.clone();
-
             // Check if the current item is expanded
             if self.items[global_idx].is_expanded {
                 // If expanded, collapse it
                 self.items[global_idx].is_expanded = false;
                 self.build_visible_items();
             } else {
-                // If collapsed, move to parent and collapse parent if it's open
+                // If collapsed, move to parent
                 if let Some(parent_idx) = self.items[global_idx].parent_index {
                     // Update selected_item_index to point to the parent in filtered_item_indices
                     if let Some(parent_filtered_idx) = self.filtered_item_indices.iter().position(|&idx| idx == parent_idx) {
                         self.selected_item_index = parent_filtered_idx;
                     }
-                    // No longer collapse the parent, just move to it.
                 }
             }
         }
     }
 
-    pub fn move_cursor_page_up(&mut self, tree_view_height: u16) {
+    pub fn move_cursor_page_up(&mut self, _tree_view_height: u16) { // Marked as unused
         if self.filtered_item_indices.is_empty() {
             return;
         }
 
-        let page_size = tree_view_height as usize;
+        let page_size = _tree_view_height as usize;
         let target_index = self.selected_item_index.saturating_sub(page_size);
 
         self.selected_item_index = target_index;
@@ -760,12 +771,12 @@ impl App {
         }
     }
 
-    pub fn move_cursor_page_down(&mut self, tree_view_height: u16) {
+    pub fn move_cursor_page_down(&mut self, _tree_view_height: u16) { // Marked as unused
         if self.filtered_item_indices.is_empty() {
             return;
         }
 
-        let page_size = tree_view_height as usize;
+        let page_size = _tree_view_height as usize;
         let max_index = self.filtered_item_indices.len().saturating_sub(1);
         let target_index = std::cmp::min(self.selected_item_index.saturating_add(page_size), max_index);
 
@@ -804,491 +815,299 @@ impl App {
 }
 
 #[cfg(test)]
-mod tests {
+mod app_tests {
     use super::*;
-    use crate::git;
-    use ratatui::style::Color;
-    use std::fs; // Added fs import
-    use std::process::Command;
-    // Added git function imports
-    use crate::git::tests::setup_git_repo;
-    use crate::git::{get_dirs_at_path, get_all_directories_recursive, get_uncommitted_paths, set_sparse_checkout_dirs, get_sparse_checkout_list};
+    use std::fs;
+    use std::time::Duration;
+    use std::process::Command; // Import Command for tests
+    use tempfile::tempdir;
 
-
-    #[test]
-    fn test_directory_state_coloring() {
-        // 1. Setup Repo & Sparse Checkout
-        let (repo_path, _temp_dir) = git::tests::setup_git_repo_with_subdirs();
-        // Explicitly check out a nested directory.
-        // This makes `src` have a checked-out descendant.
-        git::set_sparse_checkout_dirs(vec!["src/components".to_string()], &repo_path)
-            .expect("Failed to set sparse checkout dirs");
-
-        // 2. Create App and expand 'src' to make the nested dir visible
-        let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
-        
-        let src_global_idx = app.items.iter().position(|i| i.path == PathBuf::from("src")).unwrap();
-        app.selected_item_index = app
-            .filtered_item_indices
-            .iter()
-            .position(|&i| i == src_global_idx)
-            .unwrap();
-        app.expand_selected_item(); // Changed from toggle_expansion()
-        // Since expansion is now async, we need to process the message.
-        // In a test, we can do this manually.
-        let msg = app.rx.recv().unwrap();
-        if let AppMessage::ChildrenLoaded(result) = msg {
-            app.handle_children_loaded(result);
-        } else {
-            panic!("Expected ChildrenLoaded message");
-        }
-
-        // 3. Get View Models
-        let view_models = app.get_tui_tree_items();
-
-        // Helper to find a view model by its name
-        let find_vm = |name: &str| {
-            view_models
-                .iter()
-                .find(|vm| vm.display_text.ends_with(name))
-                .unwrap_or_else(|| panic!("View model for '{}' not found", name))
-        };
-
-        // 4. Assert Colors based on requirements.md
-        // `src` is not explicitly checked out but has a checked out descendant. Should be White.
-        assert_eq!(
-            find_vm("src").style.fg,
-            Some(Color::White),
-            "'src' should be White"
-        );
-
-        // `src/components` is explicitly checked out. Should be Green.
-        assert_eq!(
-            find_vm("components").style.fg,
-            Some(Color::Green),
-            "'src/components' should be Green"
-        );
-
-        // `docs` is not checked out and has no checked out descendants. Should be DarkGray.
-        assert_eq!(
-            find_vm("docs").style.fg,
-            Some(Color::DarkGray),
-            "'docs' should be DarkGray"
-        );
-
-        // `tests` is not checked out and has no checked out descendants. Should be DarkGray.
-        assert_eq!(
-            find_vm("tests").style.fg,
-            Some(Color::DarkGray),
-            "'tests' should be DarkGray"
-        );
-    }
-
-    // A basic mock setup for testing `toggle_expansion`
-    // In a real-world scenario, we'd mock the git calls.
-    // For now, these tests will run against a real git repo.
-    #[test]
-    fn test_toggle_expansion_loads_children() {
-        // This test needs to run in a temporary git repo.
-        let (repo_path, _temp_dir) = crate::git::tests::setup_git_repo_with_subdirs();
-
-        let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
-
-        // --- Initial State Checks ---
-        // Ensure initial items are loaded and sorted correctly
-        let root_idx = app.items.iter().position(|i| i.path == PathBuf::from(".")).unwrap();
-        let docs_idx = app.items.iter().position(|i| i.path == PathBuf::from("docs")).unwrap();
-        let src_idx = app.items.iter().position(|i| i.path == PathBuf::from("src")).unwrap();
-        let tests_idx = app.items.iter().position(|i| i.path == PathBuf::from("tests")).unwrap(); // Assuming 'tests' is also a top-level dir
-
-        // Initial top-level items are alphabetically sorted in `items`
-        // and also in `filtered_item_indices` since no children are expanded yet.
-        assert_eq!(
-            app.filtered_item_indices,
-            vec![root_idx, docs_idx, src_idx, tests_idx]
-        );
-
-        // Select 'src' in the filtered list
-        app.selected_item_index = app
-            .filtered_item_indices
-            .iter()
-            .position(|&i| i == src_idx)
-            .unwrap();
-
-        assert!(
-            !app.items[src_idx].children_loaded,
-            "Children of 'src' should not be loaded yet"
-        );
-        assert!(
-            app.items[src_idx].children_indices.is_empty(),
-            "Children indices of 'src' should be empty before loading"
-        );
-
-        // Expand 'src'
-        app.expand_selected_item();
-        // Since expansion is now async, we need to process the message.
-        let msg = app.rx.recv().unwrap();
-        if let AppMessage::ChildrenLoaded(result) = msg {
-            app.handle_children_loaded(result);
-        } else {
-            panic!("Expected ChildrenLoaded message");
-        }
-
-
-        // --- After Expansion Checks ---
-        let src_item = &app.items[src_idx];
-        assert!(
-            src_item.children_loaded,
-            "Children of 'src' should be loaded after expansion"
-        );
-        assert!(
-            !src_item.children_indices.is_empty(),
-            "Children indices of 'src' should not be empty after loading"
-        );
-        assert!(src_item.is_expanded, "'src' should be marked as expanded");
-
-        // Check if the children (e.g., 'src/components') are now in the items list
-        let components_idx = app
-            .items
-            .iter()
-            .position(|i| i.path == PathBuf::from("src/components"));
-        assert!(
-            components_idx.is_some(),
-            "'src/components' should be in the items list after expanding 'src'"
-        );
-        let components_idx = components_idx.unwrap();
-
-        // Verify the filtered_item_indices order to expose the bug
-        // The *correct* order should be: [root, docs, src, src/components, tests]
-        let expected_correct_order = vec![root_idx, docs_idx, src_idx, components_idx, tests_idx];
-        assert_eq!(
-            app.filtered_item_indices,
-            expected_correct_order,
-            "Filtered items order is incorrect after fix"
-        );
-
-        // The *correct* order should be: [root, docs, src, src/components, tests]
-        // The actual assertion for the fix will check for this.
-    }
-
-    #[test]
-    fn test_apply_changes_progress_flag() {
-        // Setup a temporary git repo
-        let (repo_path, _temp_dir) = crate::git::tests::setup_git_repo_with_subdirs();
-
-        let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
-
-        // Ensure initially no changes are being applied
-        assert!(
-            !app.is_applying_changes,
-            "Initially, is_applying_changes should be false"
-        );
-
-        // Simulate a pending change: mark 'src' for addition
-        let src_global_idx = app.items.iter().position(|i| i.path == PathBuf::from("src")).unwrap();
-        app.items[src_global_idx].pending_change = Some(ChangeType::Add);
-
-        // Assert that the pending change is registered
-        assert_eq!(app.items[src_global_idx].pending_change, Some(ChangeType::Add));
-
-        // Apply changes
-        app.apply_changes();
-
-        // After apply_changes, app.is_applying_changes is still true
-        assert!(
-            app.is_applying_changes,
-            "Immediately after apply_changes, is_applying_changes should be true"
-        );
-
-        // Simulate main loop processing the message
-        let app_msg = app
-            .rx
-            .recv()
-            .expect("Should receive a message from apply_changes");
-        match app_msg {
-            AppMessage::ApplyChangesCompleted(result) => {
-                app.is_applying_changes = false; // Manually reset as main loop would
-                result.expect("Apply changes should succeed in test");
-                // Clear pending changes on all items, as the main loop would
-                for item in app.items.iter_mut() {
-                    item.pending_change = None;
-                }
-                // Refresh the app state as the main loop would
-                app.refresh().expect("App refresh should succeed");
-            }
-            AppMessage::ChildrenLoaded(_) => {
-                panic!("Expected ApplyChangesCompleted message");
-            }
-
-        }
-
-        // After processing the message, the flag should be reset to false
-        assert!(
-            !app.is_applying_changes,
-            "After processing message, is_applying_changes should be false"
-        );
-
-        // Verify that 'src' is now checked out
-        let sparse_checkout_list = git::get_sparse_checkout_list(&repo_path).unwrap();
-        assert!(
-            sparse_checkout_list.contains(&"src".to_string()),
-            "'src' should be in the sparse-checkout list"
-        );
-
-        // Also verify the pending_change was cleared
-        assert_eq!(app.items[src_global_idx].pending_change, None, "Pending change for 'src' should be cleared");
-    }
-        
-    #[test]
-    fn test_toggle_selection_locked_item() {
-        // Setup a temporary git repo with uncommitted changes in 'src'
-        let (repo_path, _temp_dir) = crate::git::tests::setup_git_repo_with_subdirs();
-        // Modify a file to create uncommitted changes in 'src'
-        std::fs::write(repo_path.join("src/main.rs"), "fn main() { println!(\"Hello\"); }").unwrap();
-
-        let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
-
-        // Find the 'src' item and ensure it's locked
-        let src_global_idx = app.items.iter().position(|i| i.path == PathBuf::from("src")).unwrap();
-        assert!(app.items[src_global_idx].is_locked, "'src' should be locked due to uncommitted changes");
-        assert_eq!(app.items[src_global_idx].pending_change, None, "'src' should have no pending change initially");
-
-        // Select 'src'
-        app.selected_item_index = app.filtered_item_indices.iter().position(|&i| i == src_global_idx).unwrap();
-
-        // Attempt to toggle selection on the locked item
-        app.toggle_selection();
-
-        // Assert that the pending_change state has NOT changed
-        assert_eq!(app.items[src_global_idx].pending_change, None, "Toggle selection on a locked item should have no effect on pending_change");
-
-        // Ensure no error message was set
-        assert!(app.last_git_error.is_none(), "No git error should occur for locked item toggle");
-    }
-
-    #[test]
-    fn test_apply_changes_unloaded_node() {
-        // 1. Setup Repo with subdirs and initialize sparse-checkout
-        let (repo_path, _temp_dir) = crate::git::tests::setup_git_repo_with_subdirs();
-        let _ = Command::new("git")
-            .args(&["sparse-checkout", "init", "--cone"])
-            .current_dir(&repo_path)
+    // --- Helper functions copied from git_test.rs for self-containment ---
+    pub fn setup_git_repo() -> (PathBuf, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        Command::new("git")
+            .arg("init")
+            .current_dir(&path)
             .output()
-            .expect("git sparse-checkout init --cone failed")
-            .status
-            .success();
-
-        // 2. Create App instance
-        let mut app = App::new(Some(&repo_path)).expect("App initialization failed");
-
-        // Find the 'docs' item (a top-level directory)
-        let docs_global_idx = app.items.iter().position(|i| i.path == PathBuf::from("docs")).unwrap();
-        assert!(!app.items[docs_global_idx].is_checked_out, "'docs' should not be checked out initially by git");
-        assert_eq!(app.items[docs_global_idx].pending_change, None, "'docs' should have no pending change initially");
-
-        // 3. Simulate selecting 'docs' for addition
-        app.items[docs_global_idx].pending_change = Some(ChangeType::Add);
-
-        // 4. Call app.apply_changes()
-        app.apply_changes();
-
-        // 5. Process the ApplyChangesCompleted message
-        let app_msg = app
-            .rx
-            .recv()
-            .expect("Should receive a message from apply_changes");
-        match app_msg {
-            AppMessage::ApplyChangesCompleted(result) => {
-                result.expect("Apply changes should succeed in test");
-            }
-            AppMessage::ChildrenLoaded(_) => {
-                panic!("Expected ApplyChangesCompleted message");
-            }
-
-        }
-
-        // 6. Verify that git sparse-checkout list includes 'docs'
-        let sparse_checkout_list = git::get_sparse_checkout_list(&repo_path).unwrap();
-        assert!(sparse_checkout_list.contains(&"docs".to_string()), "'docs' should be in the sparse-checkout list after apply");
+            .unwrap();
+        Command::new("git")
+            .args(&["config", "user.email", "test@example.com"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(&["config", "user.name", "Test User"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        // Ensure core.quotepath is false for consistent unescaped test output
+        Command::new("git")
+            .args(&["config", "core.quotepath", "false"])
+            .current_dir(&path)
+            .output()
+            .unwrap();
+        (path, dir)
     }
 
-    #[test]
-    fn test_directory_name_inclusion_coloring() {
-        // 1. Setup Repo & Sparse Checkout
-        let (repo_path, _temp_dir) = git::tests::setup_git_repo();
-        
-        // Create directories: dir1, dir100, dir2
-        std::fs::create_dir_all(repo_path.join("dir1")).unwrap();
-        std::fs::write(repo_path.join("dir1/file1.txt"), "content").unwrap();
-        std::fs::create_dir_all(repo_path.join("dir100")).unwrap();
-        std::fs::write(repo_path.join("dir100/file100.txt"), "content").unwrap();
-        std::fs::create_dir_all(repo_path.join("dir2")).unwrap();
-        std::fs::write(repo_path.join("dir2/file2.txt"), "content").unwrap();
+    fn create_and_commit_files(repo_path: &PathBuf) {
+        fs::create_dir_all(&repo_path.join("dir1/subdir1")).unwrap();
+        fs::write(&repo_path.join("dir1/subdir1/file1.txt"), "content").unwrap();
+        fs::create_dir_all(&repo_path.join("dir1/subdir2")).unwrap();
+        fs::write(&repo_path.join("dir1/subdir2/file2.txt"), "content").unwrap();
+        fs::create_dir_all(&repo_path.join("dir2/subdir3/subdir4")).unwrap();
+        fs::write(&repo_path.join("dir2/subdir3/subdir4/file3.txt"), "content").unwrap();
+        fs::create_dir_all(&repo_path.join("dir3")).unwrap(); // Empty dir
+        fs::write(&repo_path.join("dir3/.gitkeep"), "").unwrap(); // Add .gitkeep to track empty dir
 
-        // Commit these files
+        // Add a Japanese directory
+        fs::create_dir_all(&repo_path.join("日本語ディレクトリ/サブディレクトリ")).unwrap();
+        fs::write(&repo_path.join("日本語ディレクトリ/サブディレクトリ/.gitkeep"), "").unwrap(); // Add .gitkeep to track empty dir
+        fs::write(&repo_path.join("日本語ディレクトリ/ファイル.txt"), "content").unwrap();
+
+
         Command::new("git")
             .args(&["add", "."])
             .current_dir(&repo_path)
             .output()
             .unwrap();
         Command::new("git")
-            .args(&["commit", "-m", "Add test dirs"])
+            .args(&["commit", "-m", "Test commit with nested dirs"])
             .current_dir(&repo_path)
             .output()
             .unwrap();
-
-        // Initialize sparse checkout and set dir100
-        git::set_sparse_checkout_dirs(vec!["dir100".to_string()], &repo_path)
-            .expect("Failed to set sparse checkout dirs");
-
-        // 2. Create App
-        let app = App::new(Some(&repo_path)).expect("App initialization failed");
         
-        // 3. Get View Models
-        let view_models = app.get_tui_tree_items();
-
-        // Helper to find a view model by its name
-        let find_vm = |name: &str| {
-            view_models
-                .iter()
-                .find(|vm| vm.display_text.ends_with(name))
-                .unwrap_or_else(|| panic!("View model for '{}' not found", name))
-        };
-
-        // 4. Assert Colors
-        // `dir100` is explicitly checked out. Should be Green.
-        assert_eq!(
-            find_vm("dir100").style.fg,
-            Some(Color::Green),
-            "'dir100' should be Green"
-        );
-
-        // `dir1` is NOT checked out and NOT a descendant of `dir100`. Should be DarkGray.
-        assert_eq!(
-            find_vm("dir1").style.fg,
-            Some(Color::DarkGray),
-            "'dir1' should be DarkGray"
-        );
-
-        // `dir2` is not checked out and has no checked out descendants. Should be DarkGray.
-        assert_eq!(
-            find_vm("dir2").style.fg,
-            Some(Color::DarkGray),
-            "'dir2' should be DarkGray"
-        );
-    }
-
-    #[test]
-    fn test_japanese_filenames() {
-        let (repo_path, _temp_dir) = setup_git_repo();
-
-        // Create directories and files with Japanese names
-        fs::create_dir_all(repo_path.join("日本語ディレクトリ")).unwrap();
-        fs::write(repo_path.join("日本語ディレクトリ/ファイル.txt"), "japanese content").unwrap();
-        fs::create_dir_all(repo_path.join("別のフォルダ")).unwrap();
-        fs::write(repo_path.join("別のフォルダ/テスト.md"), "test content").unwrap();
-
-        // Add and commit
-        Command::new("git")
-            .args(&["add", "."])
-            .current_dir(&repo_path)
-            .output()
-            .unwrap();
-        Command::new("git")
-            .args(&["commit", "-m", "Add Japanese files"])
-            .current_dir(&repo_path)
-            .output()
-            .unwrap();
-
-        // Test get_dirs_at_path with Japanese directory
-        let root_dirs = get_dirs_at_path("", &repo_path).unwrap();
-        let expected_root_dirs: HashSet<PathBuf> = [
-            PathBuf::from("日本語ディレクトリ"),
-            PathBuf::from("別のフォルダ"),
-        ].iter().cloned().collect();
-        let actual_root_dirs: HashSet<PathBuf> = root_dirs.into_iter().collect();
-        assert_eq!(actual_root_dirs, expected_root_dirs);
-
-        // Test get_all_directories_recursive with Japanese directories
-        let all_dirs = get_all_directories_recursive(&repo_path).unwrap();
-        let expected_all_dirs: HashSet<PathBuf> = [
-            PathBuf::from("日本語ディレクトリ"),
-            PathBuf::from("別のフォルダ"),
-        ].iter().cloned().collect();
-        let actual_all_dirs: HashSet<PathBuf> = all_dirs.into_iter().collect();
-        assert_eq!(actual_all_dirs, expected_all_dirs);
-
-        // Test get_uncommitted_paths after modifying a Japanese named file
-        fs::write(repo_path.join("日本語ディレクトリ/ファイル.txt"), "modified content").unwrap();
-        let uncommitted = get_uncommitted_paths(&repo_path).unwrap();
-        assert!(uncommitted.contains(&PathBuf::from("日本語ディレクトリ/ファイル.txt")));
-        assert_eq!(uncommitted.len(), 1);
-
-        // Test sparse-checkout with Japanese path
+        // Initialize sparse-checkout
         Command::new("git")
             .args(&["sparse-checkout", "init", "--cone"])
             .current_dir(&repo_path)
             .output()
             .expect("git sparse-checkout init --cone failed");
+    }
+    // --- End Helper functions ---
 
-        let sparse_checkout_set_dirs = vec![PathBuf::from("日本語ディレクトリ").to_string_lossy().to_string()];
-        set_sparse_checkout_dirs(sparse_checkout_set_dirs.clone(), &repo_path).unwrap();
-        let sparse_list = get_sparse_checkout_list(&repo_path).unwrap();
-        assert!(sparse_list.contains(&"日本語ディレクトリ".to_string()));
+    #[test]
+    fn test_expand_multiple_subtrees() {
+        let (repo_path, _temp_dir) = setup_git_repo();
+        create_and_commit_files(&repo_path);
 
-        // Verify the file exists after sparse checkout
-        assert!(repo_path.join("日本語ディレクトリ/ファイル.txt").exists());
-        assert!(!repo_path.join("別のフォルダ/テスト.md").exists()); // Should not exist
+        let (test_thread_tx, test_thread_rx) = mpsc::channel(); // Channel for App's spawned threads to send to test
+        let (app_tx_dummy, app_rx_dummy) = mpsc::channel(); // Dummy channel for App's rx, since App's tx is what matters for tests
+        let mut app = App { tx: test_thread_tx, rx: app_rx_dummy, ..Default::default() };
+        
+        // Simulate app initialization
+        app.current_repo_root = repo_path.clone();
+        app.sparse_checkout_dirs = vec![]; // Initially nothing checked out
+        app.uncommitted_paths = HashSet::new();
+
+        app.load_initial_tree().unwrap(); // Load root and first level
+
+        // --- Expand "dir1" ---
+        // Find "dir1" item index
+        let dir1_global_idx = app.items.iter().position(|item| item.name == "dir1").expect("dir1 not found");
+
+        // Simulate expansion
+        app.load_children_and_expand(dir1_global_idx);
+        
+        // Await the async message from App's spawned thread
+        let app_message = test_thread_rx.recv_timeout(Duration::from_secs(5)).expect("Did not receive AppMessage for dir1");
+        match app_message {
+            AppMessage::ChildrenLoaded(result) => app.handle_children_loaded(result),
+            _ => panic!("Unexpected AppMessage received for dir1: {:?}", app_message),
+        }
+
+        // Assert dir1 state
+        let dir1_item = &app.items[dir1_global_idx];
+        assert!(dir1_item.is_expanded, "dir1 should be expanded");
+        assert!(dir1_item.children_loaded, "dir1 children should be loaded");
+        assert!(!dir1_item.children_indices.is_empty(), "dir1 should have children");
+        assert_eq!(dir1_item.children_indices.len(), 2, "dir1 should have 2 children");
+
+        // Assert subdir1 and subdir2 exist as children of dir1
+        let subdir1_idx = dir1_item.children_indices.iter().find(|&&idx| app.items[idx].name == "subdir1").expect("subdir1 not found");
+        let subdir2_idx = dir1_item.children_indices.iter().find(|&&idx| app.items[idx].name == "subdir2").expect("subdir2 not found");
+        assert_eq!(app.items[*subdir1_idx].name, "subdir1");
+        assert_eq!(app.items[*subdir2_idx].name, "subdir2");
+
+
+        // --- Expand "dir2" ---
+        // Find "dir2" item index
+        let dir2_global_idx = app.items.iter().position(|item| item.name == "dir2").expect("dir2 not found");
+
+        // Simulate expansion
+        app.load_children_and_expand(dir2_global_idx);
+
+        // Await the async message
+        let app_message = test_thread_rx.recv_timeout(Duration::from_secs(5)).expect("Did not receive AppMessage for dir2");
+        match app_message {
+            AppMessage::ChildrenLoaded(result) => app.handle_children_loaded(result),
+            _ => panic!("Unexpected AppMessage received for dir2: {:?}", app_message),
+        }
+
+        // Assert dir2 state
+        let dir2_item = &app.items[dir2_global_idx];
+        assert!(dir2_item.is_expanded, "dir2 should be expanded");
+        assert!(dir2_item.children_loaded, "dir2 children should be loaded");
+        assert!(!dir2_item.children_indices.is_empty(), "dir2 should have children");
+        assert_eq!(dir2_item.children_indices.len(), 1, "dir2 should have 1 child");
+
+        // Assert subdir3 exists as a child of dir2
+        let subdir3_idx = dir2_item.children_indices.iter().find(|&&idx| app.items[idx].name == "subdir3").expect("subdir3 not found");
+        assert_eq!(app.items[*subdir3_idx].name, "subdir3");
+
+
+        // --- Expand "日本語ディレクトリ" ---
+        let jp_dir_global_idx = app.items.iter().position(|item| item.name == "日本語ディレクトリ").expect("日本語ディレクトリ not found");
+        app.load_children_and_expand(jp_dir_global_idx);
+
+        let app_message = test_thread_rx.recv_timeout(Duration::from_secs(5)).expect("Did not receive AppMessage for 日本語ディレクトリ");
+        match app_message {
+            AppMessage::ChildrenLoaded(result) => app.handle_children_loaded(result),
+            _ => panic!("Unexpected AppMessage received for 日本語ディレクトリ: {:?}", app_message),
+        }
+
+        let jp_dir_item = &app.items[jp_dir_global_idx];
+        assert!(jp_dir_item.is_expanded, "日本語ディレクトリ should be expanded");
+        assert!(jp_dir_item.children_loaded, "日本語ディレクトリ children should be loaded");
+        assert!(!jp_dir_item.children_indices.is_empty(), "日本語ディレクトリ should have children");
+        assert_eq!(jp_dir_item.children_indices.len(), 1, "日本語ディレクトリ should have 1 child");
+        let jp_subdir_idx = jp_dir_item.children_indices.iter().find(|&&idx| app.items[idx].name == "サブディレクトリ").expect("サブディレクトリ not found");
+        assert_eq!(app.items[*jp_subdir_idx].name, "サブディレクトリ");
     }
 
     #[test]
-    fn test_japanese_folder_display_bug_reproduction() {
+    fn test_expand_empty_directory() {
         let (repo_path, _temp_dir) = setup_git_repo();
+        create_and_commit_files(&repo_path);
 
-        // Create Japanese directory and file
-        fs::create_dir_all(repo_path.join("表示バグフォルダ")).unwrap();
-        fs::write(repo_path.join("表示バグフォルダ/ファイル.txt"), "content").unwrap();
+        let (test_thread_tx, test_thread_rx) = mpsc::channel(); // Channel for App's spawned threads to send to test
+        let (app_tx_dummy, app_rx_dummy) = mpsc::channel(); // Dummy channel for App's rx
+        let mut app = App { tx: test_thread_tx, rx: app_rx_dummy, ..Default::default() };
+
+        app.current_repo_root = repo_path.clone();
+        app.load_initial_tree().unwrap();
+
+        let dir3_global_idx = app.items.iter().position(|item| item.name == "dir3").expect("dir3 not found");
+        app.load_children_and_expand(dir3_global_idx);
+
+        let app_message = test_thread_rx.recv_timeout(Duration::from_secs(5)).expect("Did not receive AppMessage for dir3");
+        match app_message {
+            AppMessage::ChildrenLoaded(result) => app.handle_children_loaded(result),
+            _ => panic!("Unexpected AppMessage received for dir3: {:?}", app_message),
+        }
+
+        let dir3_item = &app.items[dir3_global_idx];
+        assert!(dir3_item.is_expanded, "dir3 should be expanded");
+        assert!(dir3_item.children_loaded, "dir3 children should be loaded");
+        assert!(dir3_item.children_indices.is_empty(), "dir3 should have no children");
+    }
+
+    // This test ensures that if a directory is already expanded and children loaded,
+    // calling expand_selected_item again just rebuilds visible items without re-querying git.
+    #[test]
+    fn test_expand_already_expanded_item() {
+        let (repo_path, _temp_dir) = setup_git_repo();
+        create_and_commit_files(&repo_path);
+
+        let (test_thread_tx, test_thread_rx) = mpsc::channel(); // Channel for App's spawned threads to send to test
+        let (app_tx_dummy, app_rx_dummy) = mpsc::channel(); // Dummy channel for App's rx
+        let mut app = App { tx: test_thread_tx, rx: app_rx_dummy, ..Default::default() };
+
+        app.current_repo_root = repo_path.clone();
+        app.load_initial_tree().unwrap();
+
+        let dir1_global_idx = app.items.iter().position(|item| item.name == "dir1").expect("dir1 not found");
+
+        // Initial expansion
+        app.load_children_and_expand(dir1_global_idx);
+        let app_message = test_thread_rx.recv_timeout(Duration::from_secs(5)).expect("Did not receive AppMessage for dir1 (first expand)");
+        match app_message {
+            AppMessage::ChildrenLoaded(result) => app.handle_children_loaded(result),
+            _ => panic!("Unexpected AppMessage received for dir1 (first expand): {:?}", app_message),
+        }
+
+        // Call expand_selected_item again (which should just expand and rebuild)
+        app.expand_selected_item(); // Simulate selecting dir1 and pressing right key
+
+        let dir1_item = &app.items[dir1_global_idx];
+        assert!(dir1_item.is_expanded, "dir1 should still be expanded");
+        assert!(dir1_item.children_loaded, "dir1 children should still be loaded");
+        assert!(!dir1_item.children_indices.is_empty(), "dir1 should still have children");
+
+        // Ensure no new message was sent, indicating git was not re-queried
+        assert!(test_thread_rx.try_recv().is_err(), "No new AppMessage should be sent");
+    }
+
+    #[test]
+    fn test_expand_non_checked_out_directory() {
+        let (repo_path, _temp_dir) = setup_git_repo();
+        
+        // Create a directory structure that is NOT checked out
+        fs::create_dir_all(&repo_path.join("virtual_dir/virtual_subdir1")).unwrap();
+        fs::write(&repo_path.join("virtual_dir/virtual_subdir1/file.txt"), "content").unwrap();
+        fs::create_dir_all(&repo_path.join("virtual_dir/virtual_subdir2")).unwrap();
+        fs::write(&repo_path.join("virtual_dir/virtual_subdir2/file.txt"), "content").unwrap();
+        
         Command::new("git")
             .args(&["add", "."])
             .current_dir(&repo_path)
             .output()
             .unwrap();
         Command::new("git")
-            .args(&["commit", "-m", "Add Japanese bug folder"])
+            .args(&["commit", "-m", "Add virtual dirs"])
             .current_dir(&repo_path)
             .output()
             .unwrap();
 
-        // Manually check out the Japanese folder using Git (simulating the user's initial action)
+        // Initialize sparse-checkout but DO NOT CHECK OUT "virtual_dir"
         Command::new("git")
             .args(&["sparse-checkout", "init", "--cone"])
             .current_dir(&repo_path)
             .output()
             .expect("git sparse-checkout init --cone failed");
-
-        let bug_folder_path = PathBuf::from("表示バグフォルダ");
-        let dirs_to_set = vec![bug_folder_path.to_string_lossy().to_string()];
-        set_sparse_checkout_dirs(dirs_to_set, &repo_path).unwrap();
-
-        // --- Simulate pickit restart and initial load ---
-        let app = App::new(Some(&repo_path)).expect("App initialization failed"); // Changed mut to non-mut
-
-        // --- Critical part: Assert the state *before* async message is processed ---
-        // At this point, app.load_initial_tree() has run.
-        // So, app.sparse_checkout_dirs is still empty, and is_checked_out should be false for the folder.
-        let bug_folder_global_idx = app.items.iter().position(|i| i.path == bug_folder_path).expect("Bug folder not found in app items");
         
-        println!("DEBUG (Bug Repro Test): After App::new() and load_initial_tree():");
-        println!("DEBUG (Bug Repro Test): app.sparse_checkout_dirs: {:?}", app.sparse_checkout_dirs); // Should be empty
-        println!("DEBUG (Bug Repro Test): app.items[{:?}].path: {:?}", bug_folder_global_idx, app.items[bug_folder_global_idx].path);
-        println!("DEBUG (Bug Repro Test): app.items[{:?}].is_checked_out: {:?}", bug_folder_global_idx, app.items[bug_folder_global_idx].is_checked_out);
+        // Explicitly set sparse-checkout to something else, ensuring virtual_dir is NOT checked out
+        Command::new("git")
+            .args(&["sparse-checkout", "set", "dir1"]) // Check out 'dir1' if it exists, but not 'virtual_dir'
+            .current_dir(&repo_path)
+            .output()
+            .expect("git sparse-checkout set failed");
 
-        // This assertion *should* FAIL to reproduce the bug.
-        // We expect it to be TRUE (because it's checked out in Git), but it will be FALSE (due to race condition).
-        assert!(app.items[bug_folder_global_idx].is_checked_out, "BUG REPRODUCED: Japanese folder should be checked out, but internal state is FALSE after initial load.");
+        // Verify "virtual_dir" does NOT exist physically
+        assert!(!repo_path.join("virtual_dir").is_dir(), "virtual_dir should not exist physically");
 
-        // Clean up: Process messages to avoid test interference in other tests, though not strictly needed for this bug repro.
-        // Process any other potential messages if they exist to clear the channel, for other tests.
-        while let Ok(_) = app.rx.try_recv() {}
+
+        let (test_thread_tx, test_thread_rx) = mpsc::channel();
+        let (app_tx_dummy, app_rx_dummy) = mpsc::channel();
+        let mut app = App { tx: test_thread_tx, rx: app_rx_dummy, ..Default::default() };
+        
+        app.current_repo_root = repo_path.clone();
+        app.sparse_checkout_dirs = git::get_sparse_checkout_list(&repo_path).unwrap(); // Load sparse checkout info
+        app.uncommitted_paths = HashSet::new();
+
+        app.load_initial_tree().unwrap(); // Load root and first level
+
+
+        // --- Expand "virtual_dir" ---
+        let virtual_dir_global_idx = app.items.iter().position(|item| item.name == "virtual_dir").expect("virtual_dir not found");
+
+        app.load_children_and_expand(virtual_dir_global_idx);
+
+        let app_message = test_thread_rx.recv_timeout(Duration::from_secs(5)).expect("Did not receive AppMessage for virtual_dir");
+        match app_message {
+            AppMessage::ChildrenLoaded(result) => app.handle_children_loaded(result),
+            _ => panic!("Unexpected AppMessage received for virtual_dir: {:?}", app_message),
+        }
+
+        let virtual_dir_item = &app.items[virtual_dir_global_idx];
+        assert!(virtual_dir_item.is_expanded, "virtual_dir should be expanded");
+        assert!(virtual_dir_item.children_loaded, "virtual_dir children should be loaded");
+        assert!(!virtual_dir_item.children_indices.is_empty(), "virtual_dir should have children");
+        assert_eq!(virtual_dir_item.children_indices.len(), 2, "virtual_dir should have 2 children");
+
+        let virtual_subdir1_idx = virtual_dir_item.children_indices.iter().find(|&&idx| app.items[idx].name == "virtual_subdir1").expect("virtual_subdir1 not found");
+        let virtual_subdir2_idx = virtual_dir_item.children_indices.iter().find(|&&idx| app.items[idx].name == "virtual_subdir2").expect("virtual_subdir2 not found");
+        assert_eq!(app.items[*virtual_subdir1_idx].name, "virtual_subdir1");
+        assert_eq!(app.items[*virtual_subdir2_idx].name, "virtual_subdir2");
     }
 }

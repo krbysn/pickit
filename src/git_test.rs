@@ -22,9 +22,9 @@ mod tests {
             .current_dir(&path)
             .output()
             .unwrap();
-        // Ensure core.quotepath is true for consistent test output
+        // Ensure core.quotepath is false for consistent unescaped test output
         Command::new("git")
-            .args(&["config", "core.quotepath", "true"])
+            .args(&["config", "core.quotepath", "false"])
             .current_dir(&path)
             .output()
             .unwrap();
@@ -38,7 +38,7 @@ mod tests {
         fs::write(repo_path.join("src/components/mod.rs"), "pub fn foo() {}").unwrap();
         fs::create_dir_all(repo_path.join("docs")).unwrap();
         fs::write(repo_path.join("docs/README.md"), "# Docs").unwrap();
-        fs::create_راحfs::create_dir_all(repo_path.join("tests")).unwrap();
+        fs::create_dir_all(repo_path.join("tests")).unwrap();
         fs::write(repo_path.join("tests/test.rs"), "# Tests").unwrap();
         fs::write(repo_path.join(".gitignore"), "target/").unwrap();
         fs::create_dir_all(repo_path.join("dir with spaces")).unwrap(); // Directory with spaces
@@ -82,7 +82,7 @@ mod tests {
         let mut root_dirs = get_dirs_at_path("", &repo_path).unwrap();
         root_dirs.sort(); // Sort for consistent comparison
         let expected_root_dirs = vec![
-            "dir\ with\ spaces".to_string(),
+            "dir with spaces".to_string(),
             "docs".to_string(),
             "src".to_string(),
             "tests".to_string(),
@@ -128,7 +128,7 @@ mod tests {
         let mut sparse_dirs = get_sparse_checkout_list(&repo_path).unwrap();
         sparse_dirs.sort();
         let expected_sparse_dirs = vec![
-            "dir\ with\ spaces".to_string(),
+            "dir with spaces".to_string(),
             "docs".to_string(),
             "src".to_string(),
             "日本語ディレクトリ".to_string(),
@@ -156,7 +156,7 @@ mod tests {
         changes.sort();
         let expected_changes = vec![
             "src/main.rs".to_string(),
-            "untracked\ file.txt".to_string(),
+            "untracked file.txt".to_string(),
             "新規ファイル.txt".to_string(),
         ];
         assert_eq!(changes, expected_changes);
@@ -175,8 +175,8 @@ mod tests {
 
         let dirs_to_set = vec![
             "src".to_string(),
-            quote_path_string("dir with spaces"),
-            quote_path_string("日本語ディレクトリ"),
+            "dir with spaces".to_string(),
+            "日本語ディレクトリ".to_string(),
         ];
         set_sparse_checkout_dirs(dirs_to_set.clone(), &repo_path).unwrap();
 
@@ -191,42 +191,5 @@ mod tests {
         assert!(repo_path.join("dir with spaces/file with spaces.txt").exists());
         assert!(repo_path.join("日本語ディレクトリ/ファイル.txt").exists());
         assert!(!repo_path.join("docs/README.md").exists()); // Should not exist
-    }
-
-    #[test]
-    fn test_unescape_git_path_string_function() {
-        assert_eq!(unescape_git_path_string("foo\ bar/baz"), "foo bar/baz");
-        assert_eq!(unescape_git_path_string(""foo\ bar/baz""), "foo bar/baz"); // Double quotes
-        assert_eq!(unescape_git_path_string("foo\040bar"), "foo bar"); // Octal space
-        assert_eq!(unescape_git_path_string("file\ with\ spaces"), "file with spaces");
-        assert_eq!(unescape_git_path_string("日本語ディレクトリ"), "日本語ディレクトリ"); // No escaping needed for UTF-8 that's not special
-        assert_eq!(unescape_git_path_string(""\343\201\202.txt""), "あ.txt"); // Octal for UTF-8
-        assert_eq!(unescape_git_path_string("file
-ame"), "file
-ame"); // Backslash
-        assert_eq!(unescape_git_path_string("file"name"), "file"name"); // Quote
-        assert_eq!(unescape_git_path_string("file
-name"), "file
-name"); // Newline escape
-        assert_eq!(unescape_git_path_string(""), ""); // Empty string
-        assert_eq!(unescape_git_path_string("not_quoted"), "not_quoted"); // Not quoted
-        assert_eq!(unescape_git_path_string("a/b/c"), "a/b/c"); // Normal path
-        assert_eq!(unescape_git_path_string("trailing\ "), "trailing "); // Trailing space
-    }
-
-    #[test]
-    fn test_quote_path_string_function() {
-        assert_eq!(quote_path_string("foo bar/baz"), ""foo\ bar/baz"");
-        assert_eq!(quote_path_string("file with spaces"), ""file\ with\ spaces"");
-        assert_eq!(quote_path_string("日本語ディレクトリ"), ""\346\227\245\346\234\254\348\252\236\343\203\207\343\202\243\343\203\225\343\202\241\343\202\244\343\203\253"");
-        assert_eq!(quote_path_string("file
-name"), ""file
-name"");
-        assert_eq!(quote_path_string("a/b/c"), "a/b/c"); // No special chars, no quoting
-        assert_eq!(quote_path_string("file"name"), ""file"name"");
-        assert_eq!(quote_path_string("file
-ame"), ""file
-ame"");
-        assert_eq!(quote_path_string("foo/bar\ baz"), ""foo/bar\ baz""); // Mixed quoting
     }
 }
