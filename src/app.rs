@@ -670,8 +670,8 @@ impl App {
                     "🔒 "
                 } else {
                     match item.pending_change {
-                        Some(ChangeType::Add) => "+ ",
-                        Some(ChangeType::Remove) => "- ",
+                        Some(ChangeType::Add) => "✚ ",
+                        Some(ChangeType::Remove) => "━ ",
                         None => {
                             if item.is_checked_out {
                                 "✔ "
