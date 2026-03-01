@@ -293,7 +293,6 @@ impl App {
         // This ensures that if a checked-out descendant is not in `sparse_checkout_dirs` (e.g., implicitly added by git),
         // it still propagates up. Or if an item was already checked out but then removed.
         for i in (0..self.items.len()).rev() {
-            let item_has_explicit_checkout = self.items[i].is_checked_out;
             let children_have_checked_out_descendant = {
                 let item = &self.items[i];
                 item.children_indices.iter().any(|&child_idx| {
@@ -301,7 +300,7 @@ impl App {
                     child.is_checked_out || child.has_checked_out_descendant
                 })
             };
-            self.items[i].has_checked_out_descendant = self.items[i].has_checked_out_descendant || children_have_checked_out_descendant || item_has_explicit_checkout;
+            self.items[i].has_checked_out_descendant = self.items[i].has_checked_out_descendant || children_have_checked_out_descendant;
         }
 
 
@@ -892,7 +891,7 @@ mod app_tests {
         create_and_commit_files(&repo_path);
 
         let (test_thread_tx, test_thread_rx) = mpsc::channel(); // Channel for App's spawned threads to send to test
-        let (app_tx_dummy, app_rx_dummy) = mpsc::channel(); // Dummy channel for App's rx, since App's tx is what matters for tests
+        let (_app_tx_dummy, app_rx_dummy) = mpsc::channel(); // Dummy channel for App's rx, since App's tx is what matters for tests
         let mut app = App { tx: test_thread_tx, rx: app_rx_dummy, ..Default::default() };
         
         // Simulate app initialization
@@ -981,7 +980,7 @@ mod app_tests {
         create_and_commit_files(&repo_path);
 
         let (test_thread_tx, test_thread_rx) = mpsc::channel(); // Channel for App's spawned threads to send to test
-        let (app_tx_dummy, app_rx_dummy) = mpsc::channel(); // Dummy channel for App's rx
+        let (_app_tx_dummy, app_rx_dummy) = mpsc::channel(); // Dummy channel for App's rx
         let mut app = App { tx: test_thread_tx, rx: app_rx_dummy, ..Default::default() };
 
         app.current_repo_root = repo_path.clone();
@@ -1010,7 +1009,7 @@ mod app_tests {
         create_and_commit_files(&repo_path);
 
         let (test_thread_tx, test_thread_rx) = mpsc::channel(); // Channel for App's spawned threads to send to test
-        let (app_tx_dummy, app_rx_dummy) = mpsc::channel(); // Dummy channel for App's rx
+        let (_app_tx_dummy, app_rx_dummy) = mpsc::channel(); // Dummy channel for App's rx
         let mut app = App { tx: test_thread_tx, rx: app_rx_dummy, ..Default::default() };
 
         app.current_repo_root = repo_path.clone();
@@ -1078,7 +1077,7 @@ mod app_tests {
 
 
         let (test_thread_tx, test_thread_rx) = mpsc::channel();
-        let (app_tx_dummy, app_rx_dummy) = mpsc::channel();
+        let (_app_tx_dummy, app_rx_dummy) = mpsc::channel();
         let mut app = App { tx: test_thread_tx, rx: app_rx_dummy, ..Default::default() };
         
         app.current_repo_root = repo_path.clone();
@@ -1109,5 +1108,83 @@ mod app_tests {
         let virtual_subdir2_idx = virtual_dir_item.children_indices.iter().find(|&&idx| app.items[idx].name == "virtual_subdir2").expect("virtual_subdir2 not found");
         assert_eq!(app.items[*virtual_subdir1_idx].name, "virtual_subdir1");
         assert_eq!(app.items[*virtual_subdir2_idx].name, "virtual_subdir2");
+    }
+
+    #[test]
+    fn test_tui_item_styles() {
+        let (repo_path, _temp_dir) = setup_git_repo();
+        
+        // Create a directory structure:
+        // root/
+        //   checked_out_dir/ (Explicitly checked out)
+        //     subdir1/ (Implicitly checked out)
+        //   not_checked_out_dir/ (Not checked out, no checked out children)
+        //   path_to_checkout_dir/ (Not checked out, but has checked out child)
+        //     subdir2/ (Explicitly checked out)
+        
+        fs::create_dir_all(&repo_path.join("checked_out_dir/subdir1")).unwrap();
+        fs::write(&repo_path.join("checked_out_dir/subdir1/file.txt"), "content").unwrap();
+        fs::create_dir_all(&repo_path.join("not_checked_out_dir")).unwrap();
+        fs::write(&repo_path.join("not_checked_out_dir/.gitkeep"), "").unwrap();
+        fs::create_dir_all(&repo_path.join("path_to_checkout_dir/subdir2")).unwrap();
+        fs::write(&repo_path.join("path_to_checkout_dir/subdir2/file.txt"), "content").unwrap();
+
+        Command::new("git").args(&["add", "."]).current_dir(&repo_path).output().unwrap();
+        Command::new("git").args(&["commit", "-m", "setup"]).current_dir(&repo_path).output().unwrap();
+        Command::new("git").args(&["sparse-checkout", "init", "--cone"]).current_dir(&repo_path).output().unwrap();
+        Command::new("git").args(&["sparse-checkout", "set", "checked_out_dir", "path_to_checkout_dir/subdir2"]).current_dir(&repo_path).output().unwrap();
+
+        let (test_thread_tx, test_thread_rx) = mpsc::channel();
+        let (_app_tx, app_rx) = mpsc::channel();
+        let mut app = App {
+            current_repo_root: repo_path.clone(),
+            tx: test_thread_tx,
+            rx: app_rx,
+            ..Default::default()
+        };
+        
+        // Synchronously set up state for testing
+        app.sparse_checkout_dirs = git::get_sparse_checkout_list(&repo_path).unwrap();
+        app.uncommitted_paths = HashSet::new();
+        app.load_initial_tree().unwrap();
+
+        // Expand all top-level dirs
+        let top_level_indices: Vec<usize> = app.items[0].children_indices.clone();
+        for &idx in &top_level_indices {
+            app.load_children_and_expand(idx);
+            let msg = test_thread_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if let AppMessage::ChildrenLoaded(res) = msg {
+                app.handle_children_loaded(res);
+            }
+        }
+
+        let tree_vms = app.get_tui_tree_items();
+        
+        // Find indices in tree_vms
+        let find_vm = |name: &str| {
+            app.filtered_item_indices.iter().enumerate().find(|(_, &global_idx)| {
+                app.items[global_idx].name == name
+            }).map(|(view_idx, _)| &tree_vms[view_idx])
+        };
+
+        // 1. checked_out_dir should be Green
+        let vm = find_vm("checked_out_dir").unwrap();
+        assert_eq!(vm.style.fg, Some(Color::Green), "checked_out_dir should be Green");
+
+        // 2. subdir1 should be White (implicitly checked out)
+        let vm = find_vm("subdir1").unwrap();
+        assert_eq!(vm.style.fg, Some(Color::White), "subdir1 should be White");
+
+        // 3. not_checked_out_dir should be DarkGray
+        let vm = find_vm("not_checked_out_dir").unwrap();
+        assert_eq!(vm.style.fg, Some(Color::DarkGray), "not_checked_out_dir should be DarkGray");
+
+        // 4. path_to_checkout_dir should be White (has checked out descendant)
+        let vm = find_vm("path_to_checkout_dir").unwrap();
+        assert_eq!(vm.style.fg, Some(Color::White), "path_to_checkout_dir should be White");
+
+        // 5. subdir2 should be Green
+        let vm = find_vm("subdir2").unwrap();
+        assert_eq!(vm.style.fg, Some(Color::Green), "subdir2 should be Green");
     }
 }
