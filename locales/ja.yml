@@ -1,0 +1,46 @@
+# Locales for pickit (Japanese)
+title_tree: " ツリー表示 "
+title_grid: " グリッド表示 "
+title_sparse_not_enabled: " sparse-checkout が有効ではありません "
+title_initializing: " 初期化中 "
+title_applying: " 変更を適用中 "
+title_refreshing: " 更新中 "
+
+msg_init_full: "警告: sparse-checkout が有効ではありません。
+
+現在、すべてのディレクトリがチェックアウトされています。
+現在のファイルを維持したまま sparse-checkout を初期化します。
+
+[Enter] 初期化して開始
+[Esc/q] 終了"
+msg_init_minimal: "警告: sparse-checkout が有効ではありません。
+
+ディレクトリがチェックアウトされていないようです。
+ルート直下のみを表示する最小構成で sparse-checkout を初期化します。
+
+[Enter] 初期化して開始
+[Esc/q] 終了"
+msg_initializing: "sparse-checkout を初期化しています... しばらくお待ちください。"
+msg_applying: "変更を適用しています... しばらくお待ちください。"
+msg_refreshing: "状態を更新しています... しばらくお待ちください。"
+
+grid_name: "名前"
+grid_path: "パス"
+grid_status: "状態"
+grid_uncommitted: "未コミット"
+grid_sub_total: "サブディレクトリ (合計)"
+grid_sub_checked: "サブディレクトリ (選択済)"
+grid_pending: "保留中の変更"
+
+status_locked: "ロック済み"
+status_checked: "チェックアウト済み"
+status_not_checked: "未チェックアウト"
+
+yes: "はい"
+no: "いいえ"
+
+footer_help: " [q] 終了 [Space] 選択 [a] 適用 [r] 更新 [↑/↓] 移動 [→] 展開 [←] 折り畳み/親へ [PgUp/Dn] スクロール "
+error_init: "アプリケーションの初期化エラー: %{err}"
+error_apply_failed: "適用失敗: %{err}"
+error_refresh_failed: "更新失敗: %{err}"
+error_init_failed: "初期化失敗: %{err}"

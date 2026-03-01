@@ -1,0 +1,48 @@
+# Locales for pickit (English)
+title_tree: " Tree View "
+title_grid: " Grid View "
+title_sparse_not_enabled: " Sparse-checkout Not Enabled "
+title_initializing: " Initializing "
+title_applying: " Applying Changes "
+title_refreshing: " Refreshing "
+
+msg_init_full: "Warning: Sparse-checkout is not enabled.
+
+All directories are currently checked out.
+pickit will initialize sparse-checkout while maintaining current files.
+
+[Enter] Initialize and Continue
+
+[Esc/q] Quit"
+msg_init_minimal: "Warning: Sparse-checkout is not enabled.
+
+No directories appear to be checked out.
+pickit will initialize sparse-checkout in minimal (root-only) mode.
+
+[Enter] Initialize and Continue
+
+[Esc/q] Quit"
+msg_initializing: "Initializing sparse-checkout... Please wait."
+msg_applying: "Applying changes... Please wait."
+msg_refreshing: "Refreshing application state... Please wait."
+
+grid_name: "Name"
+grid_path: "Path"
+grid_status: "Status"
+grid_uncommitted: "Uncommitted"
+grid_sub_total: "Subdirectories (Total)"
+grid_sub_checked: "Subdirectories (Checked Out)"
+grid_pending: "Pending Changes"
+
+status_locked: "Locked"
+status_checked: "Checked Out"
+status_not_checked: "Not Checked Out"
+
+yes: "Yes"
+no: "No"
+
+footer_help: " [q] Quit [Space] Toggle [a] Apply [r] Refresh [↑/↓] Navigate [→] Expand [←] Coll/Parent [PgUp/Dn] Scroll "
+error_init: "Error initializing application: %{err}"
+error_apply_failed: "Apply failed: %{err}"
+error_refresh_failed: "Refresh failed: %{err}"
+error_init_failed: "Init failed: %{err}"

@@ -1,5 +1,6 @@
 use crate::git;
 use ratatui::style::{Color, Style};
+use rust_i18n::t;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -261,6 +262,7 @@ impl App {
 
     pub fn handle_refresh_completed(&mut self, result: Result<(Vec<String>, HashSet<String>), git::Error>) {
         self.is_refreshing = false; // Refresh is complete
+        self.is_applying_changes = false; // Also ensure applying flag is cleared
         match result {
             Ok((sparse_checkout_dirs, uncommitted_paths)) => {
                 self.update_state_from_git_info(sparse_checkout_dirs, uncommitted_paths);
@@ -590,17 +592,17 @@ impl App {
                 let item = &self.items[global_idx];
 
                 let status = if item.is_locked {
-                    "Locked".to_string()
+                    t!("status_locked").to_string()
                 } else if item.is_checked_out {
-                    "Checked Out".to_string()
+                    t!("status_checked").to_string()
                 } else {
-                    "Not Checked Out".to_string()
+                    t!("status_not_checked").to_string()
                 };
 
                 let uncommitted = if item.contains_uncommitted_changes {
-                    "Yes".to_string()
+                    t!("yes").to_string()
                 } else {
-                    "No".to_string()
+                    t!("no").to_string()
                 };
 
                 let subdirectories_checked_out = item

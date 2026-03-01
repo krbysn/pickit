@@ -14,6 +14,7 @@ use ratatui::{
     widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table},
     Terminal,
 };
+use rust_i18n::t;
 use std::{
     error::Error,
     io,
@@ -28,6 +29,9 @@ mod git;
 
 #[cfg(test)]
 mod git_test;
+
+// Init i18n
+rust_i18n::i18n!("locales");
 
 /// A TUI for git sparse-checkout.
 #[derive(Parser, Debug)]
@@ -46,6 +50,12 @@ enum InputEvent {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    // Detect system locale and set it for i18n
+    if let Some(locale) = sys_locale::get_locale() {
+        let lang = locale.split('-').next().unwrap_or("en");
+        rust_i18n::set_locale(lang);
+    }
+
     let cli = Cli::parse();
 
     if let Some(path_ref) = cli.path.as_ref() {
@@ -65,7 +75,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut app = match app::App::new(cli.path.as_ref()) {
         Ok(app) => app,
         Err(e) => {
-            eprintln!("Error initializing application: {}", e);
+            let error_msg = t!("error_init", err = e.to_string());
+            eprintln!("{}", error_msg);
             restore_terminal(&mut terminal)?;
             return Err(e.into());
         }
@@ -129,7 +140,7 @@ fn run_app(
                             match key.code {
                                 KeyCode::Enter => {
                                     if let Err(e) = app.perform_initialization() {
-                                        app.last_git_error = Some(format!("Init failed: {}", e));
+                                        app.last_git_error = Some(t!("error_init_failed", err = e.to_string()).to_string());
                                     }
                                 }
                                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
@@ -175,17 +186,20 @@ fn run_app(
                 InputEvent::App(app_msg) => {
                     match app_msg {
                         app::AppMessage::ApplyChangesCompleted(result) => {
-                            app.is_applying_changes = false; // Reset the flag
                             match result {
                                 Ok(_) => {
-                                    // Clear pending changes on all items (this was moved from App::apply_changes)
+                                    // Clear pending changes on all items
                                     for item in app.items.iter_mut() {
                                         item.pending_change = None;
                                     }
-                                    app.refresh(); // Now asynchronous
+                                    // Trigger refresh, but DON'T reset is_applying_changes yet.
+                                    // It will be reset in handle_refresh_completed.
+                                    app.is_refreshing = true;
+                                    app.refresh();
                                 }
                                 Err(e) => {
-                                    app.last_git_error = Some(e.to_string());
+                                    app.is_applying_changes = false; // Reset on error to show it
+                                    app.last_git_error = Some(t!("error_apply_failed", err = e.to_string()).to_string());
                                 }
                             }
                         }
@@ -207,23 +221,13 @@ fn run_app(
                 // Render initialization warning dialog
                 let size = f.area();
                 let block = Block::default()
-                    .title(" Sparse-checkout Not Enabled ")
+                    .title(t!("title_sparse_not_enabled").to_string())
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::Yellow));
                 
                 let msg = match strategy {
-                    app::InitStrategy::FullCheckout => 
-                        "Warning: Sparse-checkout is not enabled.\n\n\
-                         All directories are currently checked out.\n\
-                         pickit will initialize sparse-checkout while maintaining current files.\n\n\
-                         [Enter] Initialize and Continue\n\
-                         [Esc/q] Quit",
-                    app::InitStrategy::Minimal => 
-                        "Warning: Sparse-checkout is not enabled.\n\n\
-                         No directories appear to be checked out.\n\
-                         pickit will initialize sparse-checkout in minimal (root-only) mode.\n\n\
-                         [Enter] Initialize and Continue\n\
-                         [Esc/q] Quit",
+                    app::InitStrategy::FullCheckout => t!("msg_init_full").to_string(),
+                    app::InitStrategy::Minimal => t!("msg_init_minimal").to_string(),
                 };
 
                 let paragraph = Paragraph::new(msg)
@@ -241,9 +245,9 @@ fn run_app(
                 // Render initializing loading dialog
                 let size = f.area();
                 let block = Block::default()
-                    .title(" Initializing ")
+                    .title(t!("title_initializing").to_string())
                     .borders(Borders::ALL);
-                let paragraph = Paragraph::new("Initializing sparse-checkout... Please wait.")
+                let paragraph = Paragraph::new(t!("msg_initializing").to_string())
                     .alignment(Alignment::Center)
                     .block(block);
 
@@ -258,9 +262,9 @@ fn run_app(
                 // Render a loading screen
                 let size = f.area();
                 let block = Block::default()
-                    .title("Applying Changes")
+                    .title(t!("title_applying").to_string())
                     .borders(Borders::ALL);
-                let paragraph = Paragraph::new("Applying changes... Please wait.")
+                let paragraph = Paragraph::new(t!("msg_applying").to_string())
                     .style(Style::default().fg(Color::White).bg(Color::Black))
                     .alignment(Alignment::Center)
                     .block(block);
@@ -276,9 +280,9 @@ fn run_app(
                 // Render refresh loading dialog
                 let size = f.area();
                 let block = Block::default()
-                    .title("Refreshing")
+                    .title(t!("title_refreshing").to_string())
                     .borders(Borders::ALL);
-                let paragraph = Paragraph::new("Refreshing application state... Please wait.")
+                let paragraph = Paragraph::new(t!("msg_refreshing").to_string())
                     .style(Style::default().fg(Color::White).bg(Color::Black))
                     .alignment(Alignment::Center)
                     .block(block);
@@ -322,31 +326,31 @@ fn run_app(
                 list_state.select(Some(app.selected_item_index));
 
                 let tree_list = List::new(tree_items)
-                    .block(Block::default().borders(Borders::ALL).title(" Tree View "));
+                    .block(Block::default().borders(Borders::ALL).title(t!("title_tree").to_string()));
 
                 f.render_stateful_widget(tree_list, tree_area, &mut list_state);
 
                 // --- Grid View ---
-                let grid_title = " Grid View ";
+                let grid_title = t!("title_grid").to_string();
                 if let Some(grid_vm) = app.get_grid_view_model() {
                     let rows = vec![
-                        Row::new(vec![Cell::new("Name"), Cell::new(grid_vm.name)]),
-                        Row::new(vec![Cell::new("Path"), Cell::new(grid_vm.path)]),
-                        Row::new(vec![Cell::new("Status"), Cell::new(grid_vm.status)]),
+                        Row::new(vec![Cell::new(t!("grid_name").to_string()), Cell::new(grid_vm.name)]),
+                        Row::new(vec![Cell::new(t!("grid_path").to_string()), Cell::new(grid_vm.path)]),
+                        Row::new(vec![Cell::new(t!("grid_status").to_string()), Cell::new(grid_vm.status)]),
                         Row::new(vec![
-                            Cell::new("Uncommitted"),
+                            Cell::new(t!("grid_uncommitted").to_string()),
                             Cell::new(grid_vm.uncommitted),
                         ]),
                         Row::new(vec![
-                            Cell::new("Subdirectories (Total)"),
+                            Cell::new(t!("grid_sub_total").to_string()),
                             Cell::new(grid_vm.subdirectories_total),
                         ]),
                         Row::new(vec![
-                            Cell::new("Subdirectories (Checked Out)"),
+                            Cell::new(t!("grid_sub_checked").to_string()),
                             Cell::new(grid_vm.subdirectories_checked_out),
                         ]),
                         Row::new(vec![
-                            Cell::new("Pending Changes"),
+                            Cell::new(t!("grid_pending").to_string()),
                             Cell::new(grid_vm.pending_changes),
                         ]),
                     ];
@@ -366,8 +370,7 @@ fn run_app(
                 let footer_text = if let Some(err) = &app.last_git_error {
                     err.clone()
                 } else {
-                    " [q] Quit [Space] Toggle [a] Apply [r] Refresh [↑/↓] Navigate [→] Expand [←] Coll/Parent [PgUp/Dn] Scroll "
-                        .to_string()
+                    t!("footer_help").to_string()
                 };
                 let footer_block = Block::default().borders(Borders::ALL).title(footer_text);
                 f.render_widget(footer_block, footer_area);
@@ -375,3 +378,4 @@ fn run_app(
         })?; // Correctly closes the terminal.draw call
     }
 }
+
