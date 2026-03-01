@@ -26,6 +26,9 @@ use std::{
 mod app;
 mod git;
 
+#[cfg(test)]
+mod git_test;
+
 /// A TUI for git sparse-checkout.
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -121,6 +124,20 @@ fn run_app(
                         // Clear error on any key press
                         app.last_git_error = None;
 
+                        // Handle initialization state inputs
+                        if let app::InitializationState::Required(_) = app.init_state {
+                            match key.code {
+                                KeyCode::Enter => {
+                                    if let Err(e) = app.perform_initialization() {
+                                        app.last_git_error = Some(format!("Init failed: {}", e));
+                                    }
+                                }
+                                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                                _ => {}
+                            }
+                            continue; // Skip normal key handling
+                        }
+
                         // Normal application key handling
                         match key.code {
                             KeyCode::Char('q') => return Ok(()),
@@ -186,7 +203,58 @@ fn run_app(
         }
 
         terminal.draw(|f| {
-            if app.is_applying_changes {
+            if let app::InitializationState::Required(strategy) = app.init_state {
+                // Render initialization warning dialog
+                let size = f.area();
+                let block = Block::default()
+                    .title(" Sparse-checkout Not Enabled ")
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Yellow));
+                
+                let msg = match strategy {
+                    app::InitStrategy::FullCheckout => 
+                        "Warning: Sparse-checkout is not enabled.\n\n\
+                         All directories are currently checked out.\n\
+                         pickit will initialize sparse-checkout while maintaining current files.\n\n\
+                         [Enter] Initialize and Continue\n\
+                         [Esc/q] Quit",
+                    app::InitStrategy::Minimal => 
+                        "Warning: Sparse-checkout is not enabled.\n\n\
+                         No directories appear to be checked out.\n\
+                         pickit will initialize sparse-checkout in minimal (root-only) mode.\n\n\
+                         [Enter] Initialize and Continue\n\
+                         [Esc/q] Quit",
+                };
+
+                let paragraph = Paragraph::new(msg)
+                    .alignment(Alignment::Center)
+                    .block(block);
+
+                let area = Rect::new(
+                    size.width / 6,
+                    size.height / 4,
+                    size.width * 2 / 3,
+                    size.height / 2,
+                );
+                f.render_widget(paragraph, area);
+            } else if app.init_state == app::InitializationState::Initializing {
+                // Render initializing loading dialog
+                let size = f.area();
+                let block = Block::default()
+                    .title(" Initializing ")
+                    .borders(Borders::ALL);
+                let paragraph = Paragraph::new("Initializing sparse-checkout... Please wait.")
+                    .alignment(Alignment::Center)
+                    .block(block);
+
+                let area = Rect::new(
+                    size.width / 4,
+                    size.height / 3,
+                    size.width / 2,
+                    size.height / 6,
+                );
+                f.render_widget(paragraph, area);
+            } else if app.is_applying_changes {
                 // Render a loading screen
                 let size = f.area();
                 let block = Block::default()

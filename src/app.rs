@@ -19,6 +19,19 @@ pub enum ChangeType {
     Remove,
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum InitStrategy {
+    FullCheckout,
+    Minimal,
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum InitializationState {
+    None,
+    Required(InitStrategy),
+    Initializing,
+}
+
 /// Holds the display-ready information for a single item in the tree view.
 #[derive(Debug, Clone)]
 pub struct TuiTreeItemViewModel {
@@ -97,6 +110,7 @@ pub struct App {
     pub scroll_offset: usize, // For scrolling the TUI view
     pub last_git_error: Option<String>, // To display transient git errors
     pub is_applying_changes: bool, // New field to indicate if changes are being applied
+    pub init_state: InitializationState, // New field for sparse-checkout initialization state
 
     pub is_refreshing: bool, // New field to indicate if a refresh is in progress
     pub tx: mpsc::Sender<AppMessage>, // Sender for background tasks to send messages to App
@@ -119,6 +133,7 @@ impl Default for App {
             scroll_offset: 0,
             last_git_error: None,
             is_applying_changes: false,
+            init_state: InitializationState::None,
 
             is_refreshing: false, // Initialize new field
             tx: mpsc::channel().0,      // Initialize sender (dummy, will be replaced in App::new)
@@ -130,6 +145,65 @@ impl Default for App {
 }
 
 impl App {
+    pub fn check_initialization_state(&mut self) -> Result<(), git::Error> {
+        if git::is_sparse_checkout_enabled(&self.current_repo_root)? {
+            self.init_state = InitializationState::None;
+            return Ok(());
+        }
+
+        let top_level_dirs = git::get_top_level_directories(&self.current_repo_root)?;
+        if top_level_dirs.is_empty() {
+            // No directories, just init minimally
+            self.init_state = InitializationState::Required(InitStrategy::Minimal);
+            return Ok(());
+        }
+
+        // Check if any of the top level directories exist physically
+        let mut any_exists = false;
+        for dir in &top_level_dirs {
+            if self.current_repo_root.join(dir).is_dir() {
+                any_exists = true;
+                break;
+            }
+        }
+
+        if any_exists {
+            self.init_state = InitializationState::Required(InitStrategy::FullCheckout);
+        } else {
+            self.init_state = InitializationState::Required(InitStrategy::Minimal);
+        }
+
+        Ok(())
+    }
+
+    pub fn perform_initialization(&mut self) -> Result<(), git::Error> {
+        let strategy = match self.init_state {
+            InitializationState::Required(s) => s,
+            _ => return Ok(()),
+        };
+
+        self.init_state = InitializationState::Initializing;
+
+        match strategy {
+            InitStrategy::Minimal => {
+                git::init_sparse_checkout_cone(&self.current_repo_root)?;
+            }
+            InitStrategy::FullCheckout => {
+                let top_level_dirs = git::get_top_level_directories(&self.current_repo_root)?;
+                git::set_sparse_checkout_dirs(top_level_dirs, &self.current_repo_root)?;
+            }
+        }
+
+        self.init_state = InitializationState::None;
+        
+        // After initialization, we need to reload the tree because sparse_checkout_dirs has changed
+        self.sparse_checkout_dirs = git::get_sparse_checkout_list(&self.current_repo_root)?;
+        self.load_initial_tree()?;
+        self.build_visible_items();
+        
+        Ok(())
+    }
+
     // Helper to extract the parent path from a path string
     // e.g., "foo bar/baz" -> "foo bar"
     //       "foo" -> ""
@@ -645,7 +719,7 @@ impl App {
             ..Default::default()
         };
 
-        // No need to start asynchronous loading here, as it's done synchronously above.
+        app.check_initialization_state()?;
 
 
         app.load_initial_tree()?; // Now sparse_checkout_dirs is populated here

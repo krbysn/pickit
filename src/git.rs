@@ -74,7 +74,7 @@ pub fn get_sparse_checkout_list(repo_path: &Path) -> Result<Vec<String>> {
             parse_path_lines(output)
         }
         Err(Error::GitCommand(stderr)) => {
-            if stderr.contains("fatal: this worktree is not sparse") {
+            if stderr.contains("this worktree is not sparse") {
                 Ok(Vec::new())
             } else {
                 Err(Error::GitCommand(stderr))
@@ -82,6 +82,25 @@ pub fn get_sparse_checkout_list(repo_path: &Path) -> Result<Vec<String>> {
         }
         Err(e) => Err(e),
     }
+}
+
+pub fn is_sparse_checkout_enabled(repo_path: &Path) -> Result<bool> {
+    let output = run_git_command(&["config", "--get", "core.sparseCheckout"], Some(repo_path));
+    match output {
+        Ok(out) => Ok(String::from_utf8_lossy(&out.stdout).trim() == "true"),
+        Err(_) => Ok(false), // If the config doesn't exist, it's not enabled
+    }
+}
+
+pub fn get_top_level_directories(repo_path: &Path) -> Result<Vec<String>> {
+    // Get all directories at the root level using ls-tree
+    let output = run_git_command(&["ls-tree", "--name-only", "-d", "HEAD"], Some(repo_path))?;
+    parse_path_lines(output)
+}
+
+pub fn init_sparse_checkout_cone(repo_path: &Path) -> Result<()> {
+    run_git_command(&["sparse-checkout", "init", "--cone"], Some(repo_path))?;
+    Ok(())
 }
 
 pub fn get_dirs_at_path(path: &str, repo_path: &Path) -> Result<Vec<String>> {

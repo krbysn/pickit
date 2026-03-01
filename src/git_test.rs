@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::git::*;
     use std::fs;
+    use std::path::PathBuf;
+    use std::process::Command;
     use tempfile::tempdir;
 
     pub fn setup_git_repo() -> (PathBuf, tempfile::TempDir) {
@@ -63,8 +65,21 @@ mod tests {
     fn test_find_repo_root() {
         let (repo_path, _temp_dir) = setup_git_repo();
         create_and_commit_files(&repo_path);
-        let root = find_repo_root().unwrap();
-        assert_eq!(root, repo_path);
+        
+        let original_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&repo_path).unwrap();
+        
+        let root_result = find_repo_root();
+        
+        // Restore original directory immediately
+        let _ = std::env::set_current_dir(&original_dir);
+        
+        let root = root_result.unwrap();
+        // Compare canonical paths to handle platform-specific formatting differences
+        assert_eq!(
+            fs::canonicalize(root).unwrap(),
+            fs::canonicalize(repo_path).unwrap()
+        );
     }
 
     pub fn setup_git_repo_with_subdirs() -> (PathBuf, tempfile::TempDir) {
@@ -191,5 +206,35 @@ mod tests {
         assert!(repo_path.join("dir with spaces/file with spaces.txt").exists());
         assert!(repo_path.join("日本語ディレクトリ/ファイル.txt").exists());
         assert!(!repo_path.join("docs/README.md").exists()); // Should not exist
+    }
+
+    #[test]
+    fn test_sparse_checkout_detection_and_init() {
+        let (repo_path, _temp_dir) = setup_git_repo();
+        create_and_commit_files(&repo_path);
+
+        // 1. Initial state: not sparse
+        assert!(!is_sparse_checkout_enabled(&repo_path).unwrap());
+
+        // 2. Get top level directories
+        let mut top_level = get_top_level_directories(&repo_path).unwrap();
+        top_level.sort();
+        let mut expected = vec![
+            "dir with spaces".to_string(),
+            "docs".to_string(),
+            "src".to_string(),
+            "tests".to_string(),
+            "日本語ディレクトリ".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(top_level, expected);
+
+        // 3. Init with cone
+        init_sparse_checkout_cone(&repo_path).unwrap();
+        assert!(is_sparse_checkout_enabled(&repo_path).unwrap());
+
+        // 4. Verify sparse list is empty (default after init --cone)
+        let sparse_list = get_sparse_checkout_list(&repo_path).unwrap();
+        assert!(sparse_list.is_empty());
     }
 }
