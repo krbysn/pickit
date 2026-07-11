@@ -104,46 +104,50 @@ pub fn init_sparse_checkout_cone(repo_path: &Path) -> Result<()> {
 }
 
 pub fn get_dirs_at_path(path: &str, repo_path: &Path) -> Result<Vec<String>> {
-    let target_abs_path = if path.is_empty() || path == "." {
-        repo_path.to_path_buf()
-    } else {
-        repo_path.join(path) // path is already unescaped UTF-8
-    };
-
-    let mut direct_children = Vec::new();
-
-    // Strategy 1: Try running ls-tree from the target directory itself (works for physically existing dirs)
-    // This is more efficient for checked-out directories.
-    if target_abs_path.is_dir() { // Check if the directory physically exists
-        let args = vec!["ls-tree", "-r", "--name-only", "-d", "HEAD"];
-        let output = run_git_command(&args, Some(&target_abs_path))?;
-        let paths_relative_to_target = parse_path_lines(output)?;
-
-        // Filter for direct children (no slashes)
-        direct_children = paths_relative_to_target.into_iter().filter(|p| p.find('/').is_none()).collect();
-        return Ok(direct_children);
+    let mut args = vec!["ls-tree", "-d", "--name-only", "HEAD"];
+    
+    // If we're looking at a subdirectory, query only its immediate contents
+    let path_arg;
+    if !path.is_empty() && path != "." {
+        path_arg = if path.ends_with('/') {
+            path.to_string()
+        } else {
+            format!("{}/", path)
+        };
+        args.push(&path_arg);
     }
 
-    // Strategy 2: Fallback for virtual directories (not physically checked out)
-    // Query all directories recursively from the repository root and filter in Rust.
-    // This is necessary because Command::current_dir fails if target_abs_path does not exist.
-    let output = run_git_command(&["ls-tree", "-r", "--name-only", "-d", "HEAD"], Some(repo_path))?;
-    let all_dirs_from_root = parse_path_lines(output)?; // These are unescaped UTF-8 strings
-
-    let search_prefix = if path.is_empty() || path == "." {
-        "".to_string()
-    } else {
-        format!("{}/", path)
-    };
-
-    for dir in all_dirs_from_root {
-        if dir.starts_with(&search_prefix) {
-            let suffix = &dir[search_prefix.len()..];
-            if !suffix.is_empty() && suffix.find('/').is_none() {
-                direct_children.push(suffix.to_string());
+    let output = run_git_command(&args, Some(repo_path))?;
+    let lines = parse_path_lines(output)?;
+    
+    let mut direct_children = Vec::new();
+    for line in lines {
+        // Extract the simple directory name (strip parent prefix if present)
+        let simple_name = if !path.is_empty() && path != "." {
+            let prefix = if path.ends_with('/') {
+                path.to_string()
+            } else {
+                format!("{}/", path)
+            };
+            if line.starts_with(&prefix) {
+                line[prefix.len()..].to_string()
+            } else {
+                // Fallback: take part after the last slash
+                if let Some(idx) = line.rfind('/') {
+                    line[idx + 1..].to_string()
+                } else {
+                    line
+                }
             }
+        } else {
+            line
+        };
+        
+        if !simple_name.is_empty() {
+            direct_children.push(simple_name);
         }
     }
+
     Ok(direct_children)
 }
 
@@ -161,12 +165,12 @@ pub fn get_uncommitted_paths(repo_path: &Path) -> Result<HashSet<String>> {
     // Get modified and staged files using git diff --name-only HEAD
     let output = run_git_command(&["diff", "--name-only", "HEAD"], Some(repo_path))?;
     let modified_paths = parse_path_lines(output)?;
-    uncommitted_paths.extend(modified_paths.into_iter());
+    uncommitted_paths.extend(modified_paths);
 
     // Get untracked files using git ls-files --others --exclude-standard
     let output = run_git_command(&["ls-files", "--others", "--exclude-standard"], Some(repo_path))?;
     let untracked_paths = parse_path_lines(output)?;
-    uncommitted_paths.extend(untracked_paths.into_iter());
+    uncommitted_paths.extend(untracked_paths);
 
     Ok(uncommitted_paths)
 }

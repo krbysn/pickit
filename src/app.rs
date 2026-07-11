@@ -395,11 +395,7 @@ impl App {
                     false
                 };
 
-            if parent_is_effectively_checked_out {
-                self.items[i].is_implicitly_checked_out = true;
-            } else {
-                self.items[i].is_implicitly_checked_out = false;
-            }
+            self.items[i].is_implicitly_checked_out = parent_is_effectively_checked_out;
         }
     }
 
@@ -856,7 +852,7 @@ impl App {
         let target_index = std::cmp::min(self.selected_item_index.saturating_add(page_size), max_index);
 
         self.selected_item_index = target_index;
-        self.scroll_offset = std::cmp::min(self.scroll_offset.saturating_add(page_size), max_index.saturating_sub(page_size).max(0));
+        self.scroll_offset = std::cmp::min(self.scroll_offset.saturating_add(page_size), max_index.saturating_sub(page_size));
 
         // Ensure selected item is always visible after calculation
         if self.selected_item_index >= self.scroll_offset + page_size {
